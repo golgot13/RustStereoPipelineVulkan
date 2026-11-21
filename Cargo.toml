@@ -1,0 +1,24 @@
+[package]
+name = "rust-stereo-pipeline-vulkan"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-dependency Rust + Vulkan Compute recode of the Ames Stereo Pipeline with CLI and Hybrid GUI (Native X11 + Web UI)"
+license = "Apache-2.0"
+
+[lib]
+name = "stereo_pipeline"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stereo-pipeline"
+path = "src/main.rs"
+
+# Zero external crates — pure Rust standard library + dynamic OS/Vulkan/X11 FFI
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

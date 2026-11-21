@@ -1,11 +1,16 @@
-# Generally ignorable files.
+/target
+**/*.rs.bk
+*.pdb
 *~
-/build
-/build_linux
-/install
-/install_linux
-docs/_build
-GitHubReleases.txt
-
 .vscode
 *.code-workspace
+output/
+*.tif
+*.pfm
+*.pgm
+*.ppm
+*.ply
+*.xyz
+*.bmp
+*.png
+!stereo.default.example
