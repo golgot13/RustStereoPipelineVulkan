@@ -34,6 +34,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         "synthetic" => cmd_synthetic(rest),
         "vulkan-info" => cmd_vulkan_info(),
         "gui" | "stereo_gui" => cmd_gui(rest, UiMode::Auto),
+        "egui" => cmd_gui(rest, UiMode::Egui),
         "web-ui" => cmd_gui(rest, UiMode::Web),
         other => Err(format!("Unknown subcommand '{}'. Run with --help to see available commands.", other)),
     }
@@ -41,7 +42,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        r#"RustStereoPipelineVulkan v0.1.0 — Zero-Dependency Rust + Vulkan Compute Stereo Pipeline
+        r#"RustStereoPipelineVulkan v0.1.0 — Rust + Vulkan Compute Stereo Pipeline
 
 USAGE:
   stereo-pipeline <COMMAND> [ARGS...] [OPTIONS...]
@@ -61,8 +62,10 @@ COMMANDS:
       Generate synthetic planetary crater terrain, run full stereo pipeline & report RMSE vs ground truth
   vulkan-info
       Probe Vulkan Compute hardware devices and validate all built-in SPIR-V 1.0 shaders
-  gui [L.tif R.tif L.tsai R.tsai] [--x11 | --web] [--port 8080]
-      Launch Hybrid GUI (Native X11 desktop window or embedded Web UI)
+  egui [L.tif R.tif L.tsai R.tsai] [options]
+      Launch the interactive egui/eframe Desktop Studio
+  gui [L.tif R.tif L.tsai R.tsai] [--egui | --x11 | --web] [--port 8080]
+      Launch Hybrid GUI (egui Studio, Native X11 window, or Embedded Web UI)
   web-ui [L.tif R.tif L.tsai R.tsai] [--port 8080]
       Launch Embedded HTTP/1.1 Web UI workstation directly
 
@@ -176,6 +179,7 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs, String> {
                 i += 1;
                 port = args.get(i).ok_or("Missing value")?.parse().map_err(|_| "Invalid port")?;
             }
+            "--egui" => ui_mode = Some(UiMode::Egui),
             "--x11" => ui_mode = Some(UiMode::X11),
             "--web" => ui_mode = Some(UiMode::Web),
             "--cmap" => {

@@ -2,7 +2,7 @@
 name = "rust-stereo-pipeline-vulkan"
 version = "0.1.0"
 edition = "2021"
-description = "Zero-dependency Rust + Vulkan Compute recode of the Ames Stereo Pipeline with CLI and Hybrid GUI (Native X11 + Web UI)"
+description = "Rust + Vulkan Compute recode of the Ames Stereo Pipeline with CLI, egui Studio, Native X11, and Web UI"
 license = "Apache-2.0"
 
 [lib]
@@ -13,8 +13,13 @@ path = "src/lib.rs"
 name = "stereo-pipeline"
 path = "src/main.rs"
 
-# Zero external crates — pure Rust standard library + dynamic OS/Vulkan/X11 FFI
+[features]
+default = ["egui-ui"]
+# Optional egui/eframe desktop UI; compile with `--no-default-features` for 100% zero external crates
+egui-ui = ["dep:eframe"]
+
 [dependencies]
+eframe = { version = "0.31", optional = true }
 
 [profile.release]
 opt-level = 3

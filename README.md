@@ -17,15 +17,21 @@ Réécriture complète en **Rust pur (0 crate externe)** et optimisée **Vulkan 
   - `Stage 4 — stereo_tri` : triangulation 3D rayon-rayon (modèles caméras **Pinhole `.tsai`** avec distorsion Brown-Conrady et **RPC `.rpb`** satellitaire) + export **PLY / XYZ**.
   - `point2dem` & `pc_align` : génération de **DEM GeoTIFF**, ombrage lambertien (*hillshade* Vulkan/CPU) et recalage 3D **ICP Kabsch SVD**.
 - **I/O scientifique sans crate** (`src/image/io.rs`) : lecture/écriture **TIFF/GeoTIFF** (8/16/32f + tags géospatiaux), **PFM**, **PGM/PPM**, **BMP**, encodeur **PNG** pur Rust, **PLY**, **XYZ/CSV**.
-- **Interface Graphique Hybride sans crate** (`src/ui/`):
-  - **Fenêtre native X11** (`libX11.so.6` via `dlopen`) avec moteur de rendu logiciel BGRA32, police bitmap 8×8, contrôles interactifs, palettes scientifiques (*Turbo, Viridis, Inferno, Terrain, Grayscale*), zoom/pan et **vue 3D interactive du DEM**.
-  - **Web UI embarquée** (`std::net::TcpListener` HTTP/1.1 + SPA HTML5/Canvas/3D DEM) accessible partout, y compris en headless/SSH.
+- **Interface Graphique Multi-Backend** (`src/ui/`):
+  - **Studio Desktop `egui` / `eframe`** (`src/ui/egui_app.rs`, activé par défaut via la feature `egui-ui`) : exécution asynchrone en arrière-plan avec barre de progression, inspecteur complet des 5 étapes ASP, 9 calques + mode **Split View**, inspecteur de pixel au survol, ombrage *hillshade* en temps réel, vue **3D DEM interactive**, télémétrie et shaders SPIR-V.
+  - **Fenêtre native X11** (`libX11.so.6` via `dlopen`, **0 crate externe**) : moteur de rendu logiciel BGRA32 + vue 3D DEM.
+  - **Web UI embarquée** (`std::net::TcpListener`, **0 crate externe**) : SPA HTML5/Canvas/3D DEM accessible partout (headless/SSH).
 
 ## Compilation
 
 ```bash
+# Avec l'interface graphique egui (par défaut)
 cargo build --release
 cargo test
+
+# Mode 100 % zéro dépendance externe (CLI + Vulkan Compute + X11 natif + Web UI)
+cargo build --release --no-default-features
+cargo test --no-default-features
 ```
 
 ## Utilisation CLI
@@ -54,12 +60,13 @@ cargo run --release -- disparitydebug output/demo-DEM.tif output/preview --cmap 
 ## Utilisation Interface Graphique (GUI)
 
 ```bash
-# Mode hybride auto (X11 natif si $DISPLAY est présent, sinon Web UI embarquée)
+# Lancer directement le studio desktop egui
+cargo run --release -- egui
+
+# Mode hybride auto (egui si un écran est présent, sinon X11 natif, sinon Web UI)
 cargo run --release -- gui
 
-# Forcer la fenêtre native X11
+# Forcer la fenêtre native X11 (0 crate) ou la Web UI embarquée
 cargo run --release -- gui --x11
-
-# Lancer directement la Web UI embarquée sur le port 8080
 cargo run --release -- web-ui --port 8080
 ```

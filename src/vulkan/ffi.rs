@@ -387,7 +387,7 @@ pub struct VkFenceCreateInfo {
     pub flags: VkFlags,
 }
 
-// Dynamic library loading FFI (Unix dlopen/dlsym)
+// Dynamic library loading FFI (Unix dlopen/dlsym & Windows LoadLibraryA/GetProcAddress)
 #[cfg(unix)]
 extern "C" {
     fn dlopen(filename: *const c_char, flag: i32) -> *mut c_void;
@@ -397,6 +397,14 @@ extern "C" {
 
 #[cfg(unix)]
 const RTLD_NOW: i32 = 2;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryA(lpLibFileName: *const c_char) -> *mut c_void;
+    fn GetProcAddress(hModule: *mut c_void, lpProcName: *const c_char) -> *mut c_void;
+    fn FreeLibrary(hLibModule: *mut c_void) -> i32;
+}
 
 pub struct DynamicLib {
     handle: *mut c_void,
@@ -417,7 +425,18 @@ impl DynamicLib {
         None
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub fn open(candidates: &[&[u8]]) -> Option<Self> {
+        for name in candidates {
+            let h = unsafe { LoadLibraryA(name.as_ptr() as *const c_char) };
+            if !h.is_null() {
+                return Some(Self { handle: h });
+            }
+        }
+        None
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn open(_candidates: &[&[u8]]) -> Option<Self> {
         None
     }
@@ -432,7 +451,17 @@ impl DynamicLib {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub unsafe fn sym<T: Copy>(&self, name: &[u8]) -> Option<T> {
+        let p = GetProcAddress(self.handle, name.as_ptr() as *const c_char);
+        if p.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute_copy(&p))
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub unsafe fn sym<T: Copy>(&self, _name: &[u8]) -> Option<T> {
         None
     }
@@ -440,72 +469,80 @@ impl DynamicLib {
 
 impl Drop for DynamicLib {
     fn drop(&mut self) {
-        #[cfg(unix)]
         if !self.handle.is_null() {
+            #[cfg(unix)]
             unsafe {
                 dlclose(self.handle);
+            }
+            #[cfg(windows)]
+            unsafe {
+                FreeLibrary(self.handle);
             }
         }
     }
 }
 
-/// Function pointer table loaded from `libvulkan.so.1` / `libvulkan.1.dylib`.
+/// Function pointer table loaded from `vulkan-1.dll` / `libvulkan.so.1` / `libvulkan.1.dylib`.
 pub struct VkFunctions {
     pub _lib: DynamicLib,
-    pub vkCreateInstance: unsafe extern "C" fn(*const VkInstanceCreateInfo, *const c_void, *mut VkInstance) -> VkResult,
-    pub vkDestroyInstance: unsafe extern "C" fn(VkInstance, *const c_void),
-    pub vkEnumeratePhysicalDevices: unsafe extern "C" fn(VkInstance, *mut u32, *mut VkPhysicalDevice) -> VkResult,
-    pub vkGetPhysicalDeviceProperties: unsafe extern "C" fn(VkPhysicalDevice, *mut VkPhysicalDeviceProperties),
-    pub vkGetPhysicalDeviceQueueFamilyProperties: unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut VkQueueFamilyProperties),
-    pub vkGetPhysicalDeviceMemoryProperties: unsafe extern "C" fn(VkPhysicalDevice, *mut VkPhysicalDeviceMemoryProperties),
-    pub vkCreateDevice: unsafe extern "C" fn(VkPhysicalDevice, *const VkDeviceCreateInfo, *const c_void, *mut VkDevice) -> VkResult,
-    pub vkDestroyDevice: unsafe extern "C" fn(VkDevice, *const c_void),
-    pub vkGetDeviceQueue: unsafe extern "C" fn(VkDevice, u32, u32, *mut VkQueue),
-    pub vkCreateBuffer: unsafe extern "C" fn(VkDevice, *const VkBufferCreateInfo, *const c_void, *mut VkBuffer) -> VkResult,
-    pub vkDestroyBuffer: unsafe extern "C" fn(VkDevice, VkBuffer, *const c_void),
-    pub vkGetBufferMemoryRequirements: unsafe extern "C" fn(VkDevice, VkBuffer, *mut VkMemoryRequirements),
-    pub vkAllocateMemory: unsafe extern "C" fn(VkDevice, *const VkMemoryAllocateInfo, *const c_void, *mut VkDeviceMemory) -> VkResult,
-    pub vkFreeMemory: unsafe extern "C" fn(VkDevice, VkDeviceMemory, *const c_void),
-    pub vkBindBufferMemory: unsafe extern "C" fn(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) -> VkResult,
-    pub vkMapMemory: unsafe extern "C" fn(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkFlags, *mut *mut c_void) -> VkResult,
-    pub vkUnmapMemory: unsafe extern "C" fn(VkDevice, VkDeviceMemory),
-    pub vkCreateShaderModule: unsafe extern "C" fn(VkDevice, *const VkShaderModuleCreateInfo, *const c_void, *mut VkShaderModule) -> VkResult,
-    pub vkDestroyShaderModule: unsafe extern "C" fn(VkDevice, VkShaderModule, *const c_void),
-    pub vkCreateDescriptorSetLayout: unsafe extern "C" fn(VkDevice, *const VkDescriptorSetLayoutCreateInfo, *const c_void, *mut VkDescriptorSetLayout) -> VkResult,
-    pub vkDestroyDescriptorSetLayout: unsafe extern "C" fn(VkDevice, VkDescriptorSetLayout, *const c_void),
-    pub vkCreatePipelineLayout: unsafe extern "C" fn(VkDevice, *const VkPipelineLayoutCreateInfo, *const c_void, *mut VkPipelineLayout) -> VkResult,
-    pub vkDestroyPipelineLayout: unsafe extern "C" fn(VkDevice, VkPipelineLayout, *const c_void),
-    pub vkCreateComputePipelines: unsafe extern "C" fn(VkDevice, VkPipelineCache, u32, *const VkComputePipelineCreateInfo, *const c_void, *mut VkPipeline) -> VkResult,
-    pub vkDestroyPipeline: unsafe extern "C" fn(VkDevice, VkPipeline, *const c_void),
-    pub vkCreateDescriptorPool: unsafe extern "C" fn(VkDevice, *const VkDescriptorPoolCreateInfo, *const c_void, *mut VkDescriptorPool) -> VkResult,
-    pub vkDestroyDescriptorPool: unsafe extern "C" fn(VkDevice, VkDescriptorPool, *const c_void),
-    pub vkAllocateDescriptorSets: unsafe extern "C" fn(VkDevice, *const VkDescriptorSetAllocateInfo, *mut VkDescriptorSet) -> VkResult,
-    pub vkUpdateDescriptorSets: unsafe extern "C" fn(VkDevice, u32, *const VkWriteDescriptorSet, u32, *const c_void),
-    pub vkCreateCommandPool: unsafe extern "C" fn(VkDevice, *const VkCommandPoolCreateInfo, *const c_void, *mut VkCommandPool) -> VkResult,
-    pub vkDestroyCommandPool: unsafe extern "C" fn(VkDevice, VkCommandPool, *const c_void),
-    pub vkAllocateCommandBuffers: unsafe extern "C" fn(VkDevice, *const VkCommandBufferAllocateInfo, *mut VkCommandBuffer) -> VkResult,
-    pub vkBeginCommandBuffer: unsafe extern "C" fn(VkCommandBuffer, *const VkCommandBufferBeginInfo) -> VkResult,
-    pub vkEndCommandBuffer: unsafe extern "C" fn(VkCommandBuffer) -> VkResult,
-    pub vkCmdBindPipeline: unsafe extern "C" fn(VkCommandBuffer, u32, VkPipeline),
-    pub vkCmdBindDescriptorSets: unsafe extern "C" fn(VkCommandBuffer, u32, VkPipelineLayout, u32, u32, *const VkDescriptorSet, u32, *const u32),
-    pub vkCmdDispatch: unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32),
-    pub vkCreateFence: unsafe extern "C" fn(VkDevice, *const VkFenceCreateInfo, *const c_void, *mut VkFence) -> VkResult,
-    pub vkDestroyFence: unsafe extern "C" fn(VkDevice, VkFence, *const c_void),
-    pub vkWaitForFences: unsafe extern "C" fn(VkDevice, u32, *const VkFence, VkBool32, u64) -> VkResult,
-    pub vkResetFences: unsafe extern "C" fn(VkDevice, u32, *const VkFence) -> VkResult,
-    pub vkQueueSubmit: unsafe extern "C" fn(VkQueue, u32, *const VkSubmitInfo, VkFence) -> VkResult,
-    pub vkQueueWaitIdle: unsafe extern "C" fn(VkQueue) -> VkResult,
+    pub vkCreateInstance: unsafe extern "system" fn(*const VkInstanceCreateInfo, *const c_void, *mut VkInstance) -> VkResult,
+    pub vkDestroyInstance: unsafe extern "system" fn(VkInstance, *const c_void),
+    pub vkEnumeratePhysicalDevices: unsafe extern "system" fn(VkInstance, *mut u32, *mut VkPhysicalDevice) -> VkResult,
+    pub vkGetPhysicalDeviceProperties: unsafe extern "system" fn(VkPhysicalDevice, *mut VkPhysicalDeviceProperties),
+    pub vkGetPhysicalDeviceQueueFamilyProperties: unsafe extern "system" fn(VkPhysicalDevice, *mut u32, *mut VkQueueFamilyProperties),
+    pub vkGetPhysicalDeviceMemoryProperties: unsafe extern "system" fn(VkPhysicalDevice, *mut VkPhysicalDeviceMemoryProperties),
+    pub vkCreateDevice: unsafe extern "system" fn(VkPhysicalDevice, *const VkDeviceCreateInfo, *const c_void, *mut VkDevice) -> VkResult,
+    pub vkDestroyDevice: unsafe extern "system" fn(VkDevice, *const c_void),
+    pub vkGetDeviceQueue: unsafe extern "system" fn(VkDevice, u32, u32, *mut VkQueue),
+    pub vkCreateBuffer: unsafe extern "system" fn(VkDevice, *const VkBufferCreateInfo, *const c_void, *mut VkBuffer) -> VkResult,
+    pub vkDestroyBuffer: unsafe extern "system" fn(VkDevice, VkBuffer, *const c_void),
+    pub vkGetBufferMemoryRequirements: unsafe extern "system" fn(VkDevice, VkBuffer, *mut VkMemoryRequirements),
+    pub vkAllocateMemory: unsafe extern "system" fn(VkDevice, *const VkMemoryAllocateInfo, *const c_void, *mut VkDeviceMemory) -> VkResult,
+    pub vkFreeMemory: unsafe extern "system" fn(VkDevice, VkDeviceMemory, *const c_void),
+    pub vkBindBufferMemory: unsafe extern "system" fn(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) -> VkResult,
+    pub vkMapMemory: unsafe extern "system" fn(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkFlags, *mut *mut c_void) -> VkResult,
+    pub vkUnmapMemory: unsafe extern "system" fn(VkDevice, VkDeviceMemory),
+    pub vkCreateShaderModule: unsafe extern "system" fn(VkDevice, *const VkShaderModuleCreateInfo, *const c_void, *mut VkShaderModule) -> VkResult,
+    pub vkDestroyShaderModule: unsafe extern "system" fn(VkDevice, VkShaderModule, *const c_void),
+    pub vkCreateDescriptorSetLayout: unsafe extern "system" fn(VkDevice, *const VkDescriptorSetLayoutCreateInfo, *const c_void, *mut VkDescriptorSetLayout) -> VkResult,
+    pub vkDestroyDescriptorSetLayout: unsafe extern "system" fn(VkDevice, VkDescriptorSetLayout, *const c_void),
+    pub vkCreatePipelineLayout: unsafe extern "system" fn(VkDevice, *const VkPipelineLayoutCreateInfo, *const c_void, *mut VkPipelineLayout) -> VkResult,
+    pub vkDestroyPipelineLayout: unsafe extern "system" fn(VkDevice, VkPipelineLayout, *const c_void),
+    pub vkCreateComputePipelines: unsafe extern "system" fn(VkDevice, VkPipelineCache, u32, *const VkComputePipelineCreateInfo, *const c_void, *mut VkPipeline) -> VkResult,
+    pub vkDestroyPipeline: unsafe extern "system" fn(VkDevice, VkPipeline, *const c_void),
+    pub vkCreateDescriptorPool: unsafe extern "system" fn(VkDevice, *const VkDescriptorPoolCreateInfo, *const c_void, *mut VkDescriptorPool) -> VkResult,
+    pub vkDestroyDescriptorPool: unsafe extern "system" fn(VkDevice, VkDescriptorPool, *const c_void),
+    pub vkAllocateDescriptorSets: unsafe extern "system" fn(VkDevice, *const VkDescriptorSetAllocateInfo, *mut VkDescriptorSet) -> VkResult,
+    pub vkUpdateDescriptorSets: unsafe extern "system" fn(VkDevice, u32, *const VkWriteDescriptorSet, u32, *const c_void),
+    pub vkCreateCommandPool: unsafe extern "system" fn(VkDevice, *const VkCommandPoolCreateInfo, *const c_void, *mut VkCommandPool) -> VkResult,
+    pub vkDestroyCommandPool: unsafe extern "system" fn(VkDevice, VkCommandPool, *const c_void),
+    pub vkAllocateCommandBuffers: unsafe extern "system" fn(VkDevice, *const VkCommandBufferAllocateInfo, *mut VkCommandBuffer) -> VkResult,
+    pub vkBeginCommandBuffer: unsafe extern "system" fn(VkCommandBuffer, *const VkCommandBufferBeginInfo) -> VkResult,
+    pub vkEndCommandBuffer: unsafe extern "system" fn(VkCommandBuffer) -> VkResult,
+    pub vkCmdBindPipeline: unsafe extern "system" fn(VkCommandBuffer, u32, VkPipeline),
+    pub vkCmdBindDescriptorSets: unsafe extern "system" fn(VkCommandBuffer, u32, VkPipelineLayout, u32, u32, *const VkDescriptorSet, u32, *const u32),
+    pub vkCmdDispatch: unsafe extern "system" fn(VkCommandBuffer, u32, u32, u32),
+    pub vkCreateFence: unsafe extern "system" fn(VkDevice, *const VkFenceCreateInfo, *const c_void, *mut VkFence) -> VkResult,
+    pub vkDestroyFence: unsafe extern "system" fn(VkDevice, VkFence, *const c_void),
+    pub vkWaitForFences: unsafe extern "system" fn(VkDevice, u32, *const VkFence, VkBool32, u64) -> VkResult,
+    pub vkResetFences: unsafe extern "system" fn(VkDevice, u32, *const VkFence) -> VkResult,
+    pub vkQueueSubmit: unsafe extern "system" fn(VkQueue, u32, *const VkSubmitInfo, VkFence) -> VkResult,
+    pub vkQueueWaitIdle: unsafe extern "system" fn(VkQueue) -> VkResult,
 }
 
 impl VkFunctions {
     pub fn load() -> Result<Self, String> {
-        let lib = DynamicLib::open(&[
+        #[cfg(windows)]
+        let candidates: &[&[u8]] = &[b"vulkan-1.dll\0"];
+        #[cfg(not(windows))]
+        let candidates: &[&[u8]] = &[
             b"libvulkan.so.1\0",
             b"libvulkan.so\0",
             b"libvulkan.1.dylib\0",
             b"libMoltenVK.dylib\0",
-        ])
-        .ok_or_else(|| "Vulkan loader library (libvulkan.so.1) not found".to_string())?;
+        ];
+        let lib = DynamicLib::open(candidates)
+            .ok_or_else(|| "Vulkan loader library (vulkan-1.dll / libvulkan.so.1) not found".to_string())?;
 
         macro_rules! load_sym {
             ($name:literal) => {
