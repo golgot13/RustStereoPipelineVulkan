@@ -401,125 +401,247 @@ fn correlate_sgm(
         build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per)
     };
 
-    // 2. Multi-path SGM / MGM cost aggregation
+    // 2. 8-path Edge-Aware SGM / MGM cost aggregation using L2-cache-friendly 2-row DP buffers
+    //    (eliminates 170 MB per-path allocations and suppresses periodic parking-stall aliasing via gradient-adaptive P2)
     let p1 = s.sgm_p1;
-    let p2 = s.sgm_p2;
+    let p2_base = s.sgm_p2;
     let mut agg = vec![0.0f32; w * h * num_d];
 
-    // Four cardinal passes (+X, -X, +Y, -Y) and for MGM, 2D quadrant coupling
-    let dirs: &[(i32, i32)] = &[(1, 0), (-1, 0), (0, 1), (0, -1)];
-    for &(dx_dir, dy_dir) in dirs {
-        let mut path_l = vec![0.0f32; w * h * num_d];
-        let y_range: Vec<usize> = if dy_dir >= 0 { (0..h).collect() } else { (0..h).rev().collect() };
-        let x_range: Vec<usize> = if dx_dir >= 0 { (0..w).collect() } else { (0..w).rev().collect() };
+    // 2a. Horizontal passes (+X and -X) parallelized across all CPU threads directly into agg rows!
+    std::thread::scope(|scope| {
+        for (t, agg_chunk) in agg.chunks_mut(rows_per * w * num_d).enumerate() {
+            let y_start = t * rows_per;
+            let cv = &cost_vol;
+            let ldata = &left.data;
+            scope.spawn(move || {
+                let rows = agg_chunk.len() / (w * num_d);
+                let mut prev_l = vec![0.0f32; num_d];
+                let mut cur_l = vec![0.0f32; num_d];
+                for ly in 0..rows {
+                    let y = y_start + ly;
+                    let row_pix = y * w;
+                    let row_cv = row_pix * num_d;
+                    let row_agg = ly * w * num_d;
 
-        for &y in &y_range {
-            for &x in &x_range {
-                let idx = (y * w + x) * num_d;
-                let px = x as i32 - dx_dir;
-                let py = y as i32 - dy_dir;
-                let has_prev = px >= 0 && px < w as i32 && py >= 0 && py < h as i32;
-
-                if !has_prev {
+                    // Forward +X pass
                     for d in 0..num_d {
-                        path_l[idx + d] = cost_vol[idx + d];
+                        let c = cv[row_cv + d];
+                        prev_l[d] = c;
+                        agg_chunk[row_agg + d] += c;
+                    }
+                    for x in 1..w {
+                        let grad = (ldata[row_pix + x] - ldata[row_pix + x - 1]).abs();
+                        let p2_eff = (p2_base / (1.0 + 8.0 * grad)).max(p1 * 1.5);
+                        let mut min_prev = f32::INFINITY;
+                        for d in 0..num_d {
+                            if prev_l[d] < min_prev { min_prev = prev_l[d]; }
+                        }
+                        let c_off = row_cv + x * num_d;
+                        let a_off = row_agg + x * num_d;
+                        let mp2 = min_prev + p2_eff;
+                        for d in 0..num_d {
+                            let c0 = prev_l[d];
+                            let cm = if d > 0 { prev_l[d - 1] + p1 } else { f32::INFINITY };
+                            let cp = if d + 1 < num_d { prev_l[d + 1] + p1 } else { f32::INFINITY };
+                            let v = cv[c_off + d] + (c0.min(cm).min(cp).min(mp2) - min_prev);
+                            cur_l[d] = v;
+                            agg_chunk[a_off + d] += v;
+                        }
+                        std::mem::swap(&mut prev_l, &mut cur_l);
+                    }
+
+                    // Backward -X pass
+                    let last_off = (w - 1) * num_d;
+                    for d in 0..num_d {
+                        let c = cv[row_cv + last_off + d];
+                        prev_l[d] = c;
+                        agg_chunk[row_agg + last_off + d] += c;
+                    }
+                    for x in (0..w - 1).rev() {
+                        let grad = (ldata[row_pix + x] - ldata[row_pix + x + 1]).abs();
+                        let p2_eff = (p2_base / (1.0 + 8.0 * grad)).max(p1 * 1.5);
+                        let mut min_prev = f32::INFINITY;
+                        for d in 0..num_d {
+                            if prev_l[d] < min_prev { min_prev = prev_l[d]; }
+                        }
+                        let c_off = row_cv + x * num_d;
+                        let a_off = row_agg + x * num_d;
+                        let mp2 = min_prev + p2_eff;
+                        for d in 0..num_d {
+                            let c0 = prev_l[d];
+                            let cm = if d > 0 { prev_l[d - 1] + p1 } else { f32::INFINITY };
+                            let cp = if d + 1 < num_d { prev_l[d + 1] + p1 } else { f32::INFINITY };
+                            let v = cv[c_off + d] + (c0.min(cm).min(cp).min(mp2) - min_prev);
+                            cur_l[d] = v;
+                            agg_chunk[a_off + d] += v;
+                        }
+                        std::mem::swap(&mut prev_l, &mut cur_l);
+                    }
+                }
+            });
+        }
+    });
+
+    // 2b. Vertical & Diagonal passes (+Y, -Y, +1/+1, -1/+1, +1/-1, -1/-1) with compact 2-row L2-cache buffers!
+    let vd_dirs: &[(i32, i32)] = &[(0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+    let mut prev_row = vec![0.0f32; w * num_d];
+    let mut cur_row = vec![0.0f32; w * num_d];
+    let mut prev_mins = vec![0.0f32; w];
+
+    for &(dx_dir, dy_dir) in vd_dirs {
+        let y_iter: Vec<usize> = if dy_dir > 0 { (0..h).collect() } else { (0..h).rev().collect() };
+        let x_iter: Vec<usize> = if dx_dir >= 0 { (0..w).collect() } else { (0..w).rev().collect() };
+        let x_step = if dx_dir >= 0 { 1i32 } else { -1i32 };
+
+        for (step_y, &y) in y_iter.iter().enumerate() {
+            let row_pix = y * w;
+            let py = y as i32 - dy_dir;
+            let has_prev_row = step_y > 0 && py >= 0 && py < h as i32;
+
+            if has_prev_row {
+                for x in 0..w {
+                    let off = x * num_d;
+                    let mut mn = f32::INFINITY;
+                    for d in 0..num_d {
+                        if prev_row[off + d] < mn { mn = prev_row[off + d]; }
+                    }
+                    prev_mins[x] = mn;
+                }
+            }
+
+            for &x in &x_iter {
+                let px = x as i32 - dx_dir;
+                let idx = (row_pix + x) * num_d;
+                let dst = x * num_d;
+
+                if !has_prev_row || px < 0 || px >= w as i32 {
+                    for d in 0..num_d {
+                        let c = cost_vol[idx + d];
+                        cur_row[dst + d] = c;
+                        agg[idx + d] += c;
                     }
                 } else {
-                    let pidx = (py as usize * w + px as usize) * num_d;
-                    let mut min_prev = f32::INFINITY;
-                    for d in 0..num_d {
-                        if path_l[pidx + d] < min_prev {
-                            min_prev = path_l[pidx + d];
+                    let px_u = px as usize;
+                    let p_off = px_u * num_d;
+                    let min_prev = prev_mins[px_u];
+                    let grad = (left.data[row_pix + x] - left.data[py as usize * w + px_u]).abs();
+                    let p2_eff = (p2_base / (1.0 + 8.0 * grad)).max(p1 * 1.5);
+                    let mp2 = min_prev + p2_eff;
+
+                    // For MGM, blend perpendicular already-visited neighbor on current row
+                    let qx = x as i32 - x_step;
+                    let (q_valid, q_off, min_q) = if use_mgm && qx >= 0 && qx < w as i32 {
+                        let qo = qx as usize * num_d;
+                        let mut mq = f32::INFINITY;
+                        for d in 0..num_d {
+                            if cur_row[qo + d] < mq { mq = cur_row[qo + d]; }
                         }
-                    }
-                    // For MGM, blend perpendicular already-visited neighbor in scan order
-                    let (q_valid, qidx, min_q) = if use_mgm {
-                        let y_step = if dy_dir >= 0 { 1 } else { -1 };
-                        let x_step = if dx_dir >= 0 { 1 } else { -1 };
-                        let (qx, qy) = if dx_dir != 0 {
-                            (x as i32, y as i32 - y_step)
-                        } else {
-                            (x as i32 - x_step, y as i32)
-                        };
-                        if qx >= 0 && qx < w as i32 && qy >= 0 && qy < h as i32 {
-                            let qi = (qy as usize * w + qx as usize) * num_d;
-                            let mut mq = f32::INFINITY;
-                            for d in 0..num_d {
-                                if path_l[qi + d] < mq {
-                                    mq = path_l[qi + d];
-                                }
-                            }
-                            (true, qi, mq)
-                        } else {
-                            (false, 0, 0.0)
-                        }
+                        (true, qo, mq)
                     } else {
                         (false, 0, 0.0)
                     };
+                    let mq2 = min_q + p2_eff;
 
                     for d in 0..num_d {
-                        let c0 = path_l[pidx + d];
-                        let cm = if d > 0 { path_l[pidx + d - 1] + p1 } else { f32::INFINITY };
-                        let cp = if d + 1 < num_d { path_l[pidx + d + 1] + p1 } else { f32::INFINITY };
-                        let best_p = c0.min(cm).min(cp).min(min_prev + p2) - min_prev;
+                        let c0 = prev_row[p_off + d];
+                        let cm = if d > 0 { prev_row[p_off + d - 1] + p1 } else { f32::INFINITY };
+                        let cp = if d + 1 < num_d { prev_row[p_off + d + 1] + p1 } else { f32::INFINITY };
+                        let best_p = c0.min(cm).min(cp).min(mp2) - min_prev;
 
-                        let smooth_term = if q_valid {
-                            let q0 = path_l[qidx + d];
-                            let qm = if d > 0 { path_l[qidx + d - 1] + p1 } else { f32::INFINITY };
-                            let qp = if d + 1 < num_d { path_l[qidx + d + 1] + p1 } else { f32::INFINITY };
-                            let best_q = q0.min(qm).min(qp).min(min_q + p2) - min_q;
+                        let smooth = if q_valid {
+                            let q0 = cur_row[q_off + d];
+                            let qm = if d > 0 { cur_row[q_off + d - 1] + p1 } else { f32::INFINITY };
+                            let qp = if d + 1 < num_d { cur_row[q_off + d + 1] + p1 } else { f32::INFINITY };
+                            let best_q = q0.min(qm).min(qp).min(mq2) - min_q;
                             0.5 * (best_p + best_q)
                         } else {
                             best_p
                         };
-                        path_l[idx + d] = cost_vol[idx + d] + smooth_term;
+                        let v = cost_vol[idx + d] + smooth;
+                        cur_row[dst + d] = v;
+                        agg[idx + d] += v;
                     }
                 }
-                for d in 0..num_d {
-                    agg[idx + d] += path_l[idx + d];
-                }
             }
+            std::mem::swap(&mut prev_row, &mut cur_row);
         }
     }
 
-    // 3. Winner-Takes-All on Left + implicit Right-to-Left WTA from the same aggregated volume!
+    // 3. Parallel Winner-Takes-All + Uniqueness Ratio (suppresses periodic aliasing) + implicit R->L WTA
     let mut dx_lr = vec![0.0f32; w * h];
     let mut dx_rl = vec![0.0f32; w * h];
+    let mut unique_ok = vec![1u8; w * h];
 
-    for y in 0..h {
-        for x in 0..w {
-            let base = (y * w + x) * num_d;
-            let mut best_c = f32::INFINITY;
-            let mut best_d = 0;
-            for di in 0..num_d {
-                let c = agg[base + di];
-                if c < best_c {
-                    best_c = c;
-                    best_d = min_d + di as i32;
-                }
-            }
-            dx_lr[y * w + x] = best_d as f32;
+    std::thread::scope(|scope| {
+        for (t, ((lr_c, rl_c), uq_c)) in dx_lr
+            .chunks_mut(rows_per * w)
+            .zip(dx_rl.chunks_mut(rows_per * w))
+            .zip(unique_ok.chunks_mut(rows_per * w))
+            .enumerate()
+        {
+            let y_start = t * rows_per;
+            let ag = &agg;
+            scope.spawn(move || {
+                let rows = lr_c.len() / w;
+                for ly in 0..rows {
+                    let y = y_start + ly;
+                    for x in 0..w {
+                        let base = (y * w + x) * num_d;
+                        let mut best_c = f32::INFINITY;
+                        let mut best_di = 0usize;
+                        for di in 0..num_d {
+                            let c = ag[base + di];
+                            if c < best_c {
+                                best_c = c;
+                                best_di = di;
+                            }
+                        }
+                        // Uniqueness check: reject strongly ambiguous periodic matches (|di - best_di| >= 4)
+                        let mut second_c = f32::INFINITY;
+                        for di in 0..num_d {
+                            if di.abs_diff(best_di) >= 4 {
+                                let c = ag[base + di];
+                                if c < second_c {
+                                    second_c = c;
+                                }
+                            }
+                        }
+                        let loc = ly * w + x;
+                        lr_c[loc] = (min_d + best_di as i32) as f32;
+                        if num_d >= 16 && second_c.is_finite() && best_c > 1e-4 {
+                            // Require at least 0.6% margin over distant rival peak
+                            if second_c < best_c * 1.006 {
+                                uq_c[loc] = 0;
+                            }
+                        }
 
-            // Right pixel x matches left pixel x_l = x - d  => cost is agg[y][x_l][d]
-            let mut best_rc = f32::INFINITY;
-            let mut best_rd = 0i32;
-            for di in 0..num_d {
-                let d = min_d + di as i32;
-                let xl = x as i32 - d;
-                if xl >= 0 && xl < w as i32 {
-                    let c = agg[(y * w + xl as usize) * num_d + di];
-                    if c < best_rc {
-                        best_rc = c;
-                        best_rd = -d;
+                        let mut best_rc = f32::INFINITY;
+                        let mut best_rd = 0i32;
+                        for di in 0..num_d {
+                            let d = min_d + di as i32;
+                            let xl = x as i32 - d;
+                            if xl >= 0 && xl < w as i32 {
+                                let c = ag[(y * w + xl as usize) * num_d + di];
+                                if c < best_rc {
+                                    best_rc = c;
+                                    best_rd = -d;
+                                }
+                            }
+                        }
+                        rl_c[loc] = best_rd as f32;
                     }
                 }
-            }
-            dx_rl[y * w + x] = best_rd as f32;
+            });
         }
-    }
+    });
 
     let mut disp = DisparityMap::new(left.width, left.height);
     apply_lr_check(left.width, left.height, &dx_lr, &dx_rl, s.lr_threshold, &mut disp);
+    for i in 0..disp.valid.len() {
+        if unique_ok[i] == 0 {
+            disp.valid[i] = 0;
+        }
+    }
     (disp, used_vk)
 }
 

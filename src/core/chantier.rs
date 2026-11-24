@@ -524,9 +524,9 @@ pub fn build_pinhole_for_pose(
     let cu = w * 0.5 + (cal.pp_x_mm / cal.pixel_size_mm) - roi_x as f64;
     let cv = h * 0.5 - (cal.pp_y_mm / cal.pixel_size_mm) - roi_y as f64;
 
-    // Photogrammetric rotation R = Rz(kappa) * Ry(phi) * Rx(omega) (camera: +x right, +y up, -z nadir)
-    // Convert image sensor frame (+u right, +v down, +w forward/nadir) to world frame via diag(1, -1, -1)
-    let r_opk = Mat3::from_euler_xyz(
+    // Validated PMS3D / IGN / AEROPHOTOGRAM YXZ photogrammetric rotation:
+    // R_c2w_photo = Ry(phi) * Rx(omega) * Rz(kappa), converted to image sensor frame (+u right, +v down, +w nadir)
+    let r_opk = Mat3::from_opk_yxz(
         pose.omega_deg.to_radians(),
         pose.phi_deg.to_radians(),
         pose.kappa_deg.to_radians(),
@@ -546,7 +546,16 @@ pub fn build_pinhole_for_pose(
         Vec3::new(pose.x, pose.y, pose.z),
         rotation,
     );
-    cam.distortion = cal.distortion;
+    // Convert .CAM metric distortion (mm^-2, mm^-4, mm^-1) to PinholeCamera normalized coordinates (r_norm = r_mm / f_mm)
+    let f_mm = cal.focal_mm;
+    let f2 = f_mm * f_mm;
+    let [k1_mm, k2_mm, p1_mm, p2_mm] = cal.distortion;
+    cam.distortion = [
+        k1_mm * f2,
+        k2_mm * f2 * f2,
+        -p2_mm * f_mm,
+        p1_mm * f_mm,
+    ];
     cam
 }
 

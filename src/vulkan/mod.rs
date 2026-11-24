@@ -447,11 +447,57 @@ impl VulkanCompute {
         Ok((buffer, mem, size))
     }
 
-    /// Execute a cached SPIR-V compute pipeline with storage buffers and read back output buffers.
-    pub fn dispatch_cached(
+    /// Allocate a host-visible GPU storage buffer of `byte_len` bytes WITHOUT uploading zeros from CPU.
+    fn create_uninit_buffer(&self, byte_len: usize) -> Result<(VkBuffer, VkDeviceMemory, VkDeviceSize), String> {
+        let size = byte_len.max(4) as VkDeviceSize;
+        let buf_ci = VkBufferCreateInfo {
+            sType: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            pNext: ptr::null(),
+            flags: 0,
+            size,
+            usage: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            queueFamilyIndexCount: 0,
+            pQueueFamilyIndices: ptr::null(),
+        };
+        let mut buffer = 0u64;
+        let res = unsafe { (self.vk.vkCreateBuffer)(self.device, &buf_ci, ptr::null(), &mut buffer) };
+        if res != VK_SUCCESS {
+            return Err(format!("vkCreateBuffer failed ({})", res));
+        }
+        let mut reqs = VkMemoryRequirements::default();
+        unsafe { (self.vk.vkGetBufferMemoryRequirements)(self.device, buffer, &mut reqs) };
+        let mem_type = self
+            .find_host_coherent_memory(reqs.memoryTypeBits)
+            .ok_or_else(|| "No HOST_VISIBLE|HOST_COHERENT Vulkan memory type found".to_string())?;
+        let alloc_ci = VkMemoryAllocateInfo {
+            sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: ptr::null(),
+            allocationSize: reqs.size,
+            memoryTypeIndex: mem_type,
+        };
+        let mut mem = 0u64;
+        let res = unsafe { (self.vk.vkAllocateMemory)(self.device, &alloc_ci, ptr::null(), &mut mem) };
+        if res != VK_SUCCESS {
+            unsafe { (self.vk.vkDestroyBuffer)(self.device, buffer, ptr::null()) };
+            return Err(format!("vkAllocateMemory failed ({})", res));
+        }
+        let res = unsafe { (self.vk.vkBindBufferMemory)(self.device, buffer, mem, 0) };
+        if res != VK_SUCCESS {
+            unsafe {
+                (self.vk.vkFreeMemory)(self.device, mem, ptr::null());
+                (self.vk.vkDestroyBuffer)(self.device, buffer, ptr::null());
+            }
+            return Err(format!("vkBindBufferMemory failed ({})", res));
+        }
+        Ok((buffer, mem, size))
+    }
+
+    /// Execute a cached SPIR-V compute pipeline with explicit input slices (`Some`) and zero-upload output sizes (`None`).
+    fn dispatch_cached_io(
         &self,
         kind: ShaderKind,
-        buffers_in: &[&[u8]],
+        specs: &[Result<&[u8], usize>],
         readback_indices: &[usize],
         group_x: u32,
         group_y: u32,
@@ -460,9 +506,12 @@ impl VulkanCompute {
         let cached = self.get_or_compile_pipeline(kind)?;
         let _qguard = self.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-        let mut gpu_bufs = Vec::with_capacity(buffers_in.len());
-        for data in buffers_in {
-            gpu_bufs.push(self.create_buffer_with_data(data)?);
+        let mut gpu_bufs = Vec::with_capacity(specs.len());
+        for spec in specs {
+            match *spec {
+                Ok(data) => gpu_bufs.push(self.create_buffer_with_data(data)?),
+                Err(out_bytes) => gpu_bufs.push(self.create_uninit_buffer(out_bytes)?),
+            }
         }
 
         let result = self.dispatch_with_pipeline(
@@ -481,6 +530,20 @@ impl VulkanCompute {
             }
         }
         result
+    }
+
+    /// Execute a cached SPIR-V compute pipeline with storage buffers and read back output buffers.
+    pub fn dispatch_cached(
+        &self,
+        kind: ShaderKind,
+        buffers_in: &[&[u8]],
+        readback_indices: &[usize],
+        group_x: u32,
+        group_y: u32,
+        group_z: u32,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let specs: Vec<Result<&[u8], usize>> = buffers_in.iter().map(|b| Ok(*b)).collect();
+        self.dispatch_cached_io(kind, &specs, readback_indices, group_x, group_y, group_z)
     }
 
     fn dispatch_with_pipeline(
@@ -724,14 +787,13 @@ impl VulkanCompute {
             num_d as i32,
             cost_mode,
         ];
-        let vol_zeros = vec![0.0f32; vol_elems];
-        let res = self.dispatch_cached(
+        let res = self.dispatch_cached_io(
             ShaderKind::StereoCostVolume3d,
             &[
-                as_bytes(left),
-                as_bytes(right),
-                as_bytes(&vol_zeros),
-                as_bytes(&params),
+                Ok(as_bytes(left)),
+                Ok(as_bytes(right)),
+                Err(vol_elems * 4),
+                Ok(as_bytes(&params)),
             ],
             &[2],
             (width + 15) / 16,

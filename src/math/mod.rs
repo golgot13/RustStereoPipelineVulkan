@@ -218,6 +218,19 @@ impl Mat3 {
         mz.mul_mat(&my).mul_mat(&mx)
     }
 
+    /// Standard aerial photogrammetry OPK camera-to-world rotation (PMS3D / IGN / AEROPHOTOGRAM YXZ):
+    /// `R_c2w = Ry(phi) * Rx(omega) * Rz(kappa)`.
+    pub fn from_opk_yxz(omega: f64, phi: f64, kappa: f64) -> Self {
+        let (sw, cw) = omega.sin_cos();
+        let (sp, cp) = phi.sin_cos();
+        let (sk, ck) = kappa.sin_cos();
+
+        let rx = Self::new([[1.0, 0.0, 0.0], [0.0, cw, -sw], [0.0, sw, cw]]);
+        let ry = Self::new([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]]);
+        let rz = Self::new([[ck, -sk, 0.0], [sk, ck, 0.0], [0.0, 0.0, 1.0]]);
+        ry.mul_mat(&rx).mul_mat(&rz)
+    }
+
     #[inline]
     pub fn transpose(&self) -> Self {
         Self::new([
