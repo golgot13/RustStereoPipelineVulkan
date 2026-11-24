@@ -20,7 +20,8 @@ use crate::core::error::{PipelineError, Result};
 use crate::core::hardware::{HardwareProfile, ProfileTier};
 use crate::core::job::{JobInput, JobSpec, StageId};
 use crate::image::io::{
-    encode_png_rgba, load_image, load_point_cloud_xyz, save_image, save_tiff_f32, GeoTransform,
+    encode_png_rgba, load_image, load_point_cloud_xyz, save_image, save_tiff_f32,
+    stream_ply_vertices, GeoTransform, PointCloudMerger,
 };
 use crate::image::{Colormap, PointCloud};
 use crate::math::Vec3;
@@ -43,6 +44,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
     match cmd {
         "stereo" => cmd_stereo(rest),
         "chantier" => cmd_chantier(rest),
+        "merge-ply" => cmd_merge_ply(rest),
         "run" => cmd_run_job(rest),
         "batch" => cmd_batch(rest),
         "stereo_pprc" => cmd_pprc(rest),
@@ -74,9 +76,12 @@ USAGE:
   stereo-pipeline <COMMAND> [ARGS...] [OPTIONS...]
 
 COMMANDS:
-  chantier <chantier_dir> [--output <dir>] [--pair N | --all-pairs] [--roi-size 1024]
+  chantier <chantier_dir> [--output <dir>] [--pair N | --all-pairs] [--roi-size 1024] [--merge-voxel <m>]
       Auto-discover .CAM, trajectory .TXT, GCP, and GeoTIFF stereo pairs (e.g. Meyreuil DMC-IV 433Mpx)
       and run streaming Full-Scale 1:1 stereo reconstruction into Output_stereopipeline
+      (--all-pairs automatically produces a unified RGB f64 binary PLY: chantier_merged-PC.ply)
+  merge-ply <dir_or_ply1 ...> --output <merged.ply> [--merge-voxel <m>]
+      Fuse existing colorized binary/ASCII PLY point clouds into a single RGB f64 binary PLY
   stereo <L.tif> <R.tif> <L.tsai|rpb> <R.tsai|rpb> <out_prefix>
       Run full 5-stage DAG Stereo Pipeline (pprc -> corr -> rfne -> fltr -> tri -> point2dem)
   run --job <mission.json | ->
@@ -117,9 +122,12 @@ SCRIPTING & ROBUSTNESS OPTIONS:
   --profile <tier>               Hardware RAM tier: compact | standard | workstation
   --crs <code|name>              Output CRS: LOCAL | EPSG:4326 | EPSG:2154 | EPSG:3942..3950 (CC42..CC50) | EPSG:32631 | IAU:MOON | IAU:MARS
   --center-gcp                   In chantier mode, center 1:1 ROI on closest overlapping GCP
+  --merge-cloud                  Produce unified RGB f64 chantier_merged-PC.ply (auto-ON for --all-pairs)
+  --no-merge-cloud               Disable unified chantier_merged-PC.ply export
+  --merge-voxel <meters>         3D voxel fusion resolution in meters (0 = lossless full-res streaming; e.g. 0.05)
   --no-checkpoints               Disable 00_checkpoints/ TIFF writes for faster disk I/O
-  --no-ply                       Skip writing -PC.ply point cloud
-  --fast-io                      Fast batch I/O: disables checkpoints, PLY, and intermediate TIFFs (keeps DEM/hillshade/PNG/reports)
+  --no-ply                       Skip writing per-pair -PC.ply point clouds
+  --fast-io                      Fast batch I/O: skips intermediate TIFFs/checkpoints/per-pair PLYs (keeps merged RGB PLY & DEM/PNG)
   --continue-on-error            In batch mode, continue running remaining jobs on failure
 
 STEREO OPTIONS:
@@ -172,6 +180,9 @@ struct ParsedArgs {
     no_checkpoints: bool,
     no_ply: bool,
     fast_io: bool,
+    merge_cloud: bool,
+    no_merge_cloud: bool,
+    merge_voxel: f64,
 }
 
 fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
@@ -208,6 +219,9 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
     let mut no_checkpoints = false;
     let mut no_ply = false;
     let mut fast_io = false;
+    let mut merge_cloud = false;
+    let mut no_merge_cloud = false;
+    let mut merge_voxel = 0.0f64;
 
     let mut i = 0;
     while i < args.len() {
@@ -310,6 +324,14 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
             }
             "--all-pairs" => all_pairs = true,
             "--center-gcp" => center_gcp = true,
+            "--merge-cloud" => merge_cloud = true,
+            "--no-merge-cloud" => no_merge_cloud = true,
+            "--merge-voxel" => {
+                merge_voxel = next(&mut i, a)?
+                    .parse::<f64>()
+                    .map_err(|_| PipelineError::Cli("Invalid --merge-voxel (meters)".into()))?
+                    .max(0.0);
+            }
             "--no-checkpoints" => no_checkpoints = true,
             "--no-ply" => no_ply = true,
             "--fast-io" => {
@@ -363,6 +385,9 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
         no_checkpoints,
         no_ply,
         fast_io,
+        merge_cloud,
+        no_merge_cloud,
+        merge_voxel,
     })
 }
 
@@ -500,6 +525,29 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
     let cancel = CancellationToken::new();
     let mut pair_summaries = Vec::new();
 
+    let merge_enabled = (selected.len() > 1 || p.merge_cloud) && !p.no_merge_cloud;
+    let merged_ply_path = out_dir.join("chantier_merged-PC.ply");
+    let mut cloud_merger = if merge_enabled {
+        Some(PointCloudMerger::new(&merged_ply_path, p.merge_voxel)?)
+    } else {
+        None
+    };
+
+    if !p.ndjson && merge_enabled {
+        if p.merge_voxel > 0.0 {
+            println!(
+                "  Fusion nuage : {} (voxel 3D {:.3} m, f64 XYZ + RGB)",
+                merged_ply_path.display(),
+                p.merge_voxel
+            );
+        } else {
+            println!(
+                "  Fusion nuage : {} (streaming sans perte 1:1, f64 XYZ + RGB)",
+                merged_ply_path.display()
+            );
+        }
+    }
+
     for idx in selected {
         let pair = &chantier.pairs[idx];
         let pair_dir = out_dir.join(&pair.name);
@@ -603,6 +651,10 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
             |ev| emit_event(&ev, p.ndjson),
         )?;
 
+        if let Some(ref mut merger) = cloud_merger {
+            merger.add_point_cloud(&out.result.point_cloud)?;
+        }
+
         // Export colorized PNG previews for instant visual inspection
         let dem_png = encode_png_rgba(
             out.result.dem.elevation.width,
@@ -645,10 +697,154 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         ));
     }
 
+    let merge_stats = if let Some(merger) = cloud_merger {
+        Some(merger.finish()?)
+    } else {
+        None
+    };
+
     let summary_path = out_dir.join("chantier_summary.json");
     std::fs::write(&summary_path, chantier_summary_json(&chantier, &pair_summaries))?;
+
     if !p.ndjson {
-        println!("\n=== Chantier terminé — Résumé enregistré dans {} ===", summary_path.display());
+        // Global aggregated GCP validation across all processed pairs
+        let all_dz: Vec<f64> = pair_summaries
+            .iter()
+            .flat_map(|(_, _, _, _, g)| g.samples.iter().map(|s| s.dz_m))
+            .collect();
+        let total_ms: f64 = pair_summaries.iter().map(|(_, ms, _, _, _)| *ms).sum();
+        let avg_valid: f64 = if pair_summaries.is_empty() {
+            0.0
+        } else {
+            pair_summaries.iter().map(|(_, _, v, _, _)| *v).sum::<f64>() / pair_summaries.len() as f64
+        };
+
+        println!("\n=== Chantier terminé ({} paires, {:.1} s, densité moy. {:.2}%) ===",
+            pair_summaries.len(),
+            total_ms / 1000.0,
+            avg_valid
+        );
+        if !all_dz.is_empty() {
+            let n = all_dz.len() as f64;
+            let bias = all_dz.iter().sum::<f64>() / n;
+            let rmse = (all_dz.iter().map(|d| d * d).sum::<f64>() / n).sqrt();
+            let sigma = (all_dz.iter().map(|d| (d - bias) * (d - bias)).sum::<f64>() / n).sqrt();
+            let max_abs = all_dz.iter().map(|d| d.abs()).fold(0.0f64, f64::max);
+            println!(
+                "  Validation GCP Globale ({} obs.) : biais dZ={:+.3} m | RMSE={:.3} m | sigma={:.3} m | max={:.3} m",
+                all_dz.len(),
+                bias,
+                rmse,
+                sigma,
+                max_abs
+            );
+        }
+        if let Some(ref st) = merge_stats {
+            println!(
+                "  Nuage Fusionné RGB f64 : {} ({} pts, {:.1} MB)",
+                merged_ply_path.display(),
+                st.vertex_count,
+                st.file_size_bytes as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "  Emprise 3D Fusionnée   : X=[{:.2}..{:.2}] Y=[{:.2}..{:.2}] Z=[{:.2}..{:.2}] m",
+                st.min_x, st.max_x, st.min_y, st.max_y, st.min_z, st.max_z
+            );
+        }
+        println!("  Résumé JSON            : {}", summary_path.display());
+    }
+    Ok(())
+}
+
+fn collect_ply_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for p in paths {
+            if p.is_dir() {
+                collect_ply_files(&p, out);
+            } else if p.extension().and_then(|e| e.to_str()).map_or(false, |e| e.eq_ignore_ascii_case("ply")) {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+                if !name.contains("merged") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+}
+
+fn cmd_merge_ply(args: &[String]) -> Result<()> {
+    let p = parse_common_args(args)?;
+    if p.positionals.is_empty() {
+        return Err(PipelineError::Cli(
+            "Usage: merge-ply <dir_or_ply1 ...> --output <merged.ply> [--merge-voxel <m>]".into(),
+        ));
+    }
+
+    let mut inputs = Vec::new();
+    let mut out_path = p.output_dir.as_ref().map(PathBuf::from);
+    for (idx, arg) in p.positionals.iter().enumerate() {
+        let path = Path::new(arg);
+        if path.is_dir() {
+            collect_ply_files(path, &mut inputs);
+        } else if path.is_file() {
+            inputs.push(path.to_path_buf());
+        } else if out_path.is_none() && idx + 1 == p.positionals.len() {
+            out_path = Some(path.to_path_buf());
+        } else {
+            return Err(PipelineError::Io(format!("Input PLY/directory not found: {}", arg)));
+        }
+    }
+
+    if inputs.is_empty() {
+        return Err(PipelineError::Cli("No input .ply files found to merge".into()));
+    }
+    let final_out = out_path.unwrap_or_else(|| {
+        let first = Path::new(&p.positionals[0]);
+        if first.is_dir() {
+            first.join("chantier_merged-PC.ply")
+        } else {
+            first.with_file_name("chantier_merged-PC.ply")
+        }
+    });
+    if let Some(parent) = final_out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    let mut merger = PointCloudMerger::new(&final_out, p.merge_voxel)?;
+    let mut total_in = 0usize;
+    for (i, ply_path) in inputs.iter().enumerate() {
+        let mut io_err: Option<std::io::Error> = None;
+        let cnt = stream_ply_vertices(ply_path, |pt, rgb, err| {
+            if io_err.is_none() {
+                if let Err(e) = merger.add_vertex(pt, rgb, err) {
+                    io_err = Some(e);
+                }
+            }
+        })?;
+        if let Some(e) = io_err {
+            return Err(e.into());
+        }
+        total_in += cnt;
+        if !p.ndjson {
+            println!("  [{:>3}/{}] {} ({} pts)", i + 1, inputs.len(), ply_path.display(), cnt);
+        }
+    }
+    let stats = merger.finish()?;
+    if !p.ndjson {
+        println!(
+            "\n=== Fusion PLY terminée en {:.2} s ===",
+            t0.elapsed().as_secs_f64()
+        );
+        println!("  Fichiers fusionnés : {} ({} pts lus -> {} pts écrits)", inputs.len(), total_in, stats.vertex_count);
+        println!("  Sortie RGB f64 PLY : {} ({:.1} MB)", final_out.display(), stats.file_size_bytes as f64 / (1024.0 * 1024.0));
+        println!(
+            "  Emprise 3D         : X=[{:.2}..{:.2}] Y=[{:.2}..{:.2}] Z=[{:.2}..{:.2}] m",
+            stats.min_x, stats.max_x, stats.min_y, stats.max_y, stats.min_z, stats.max_z
+        );
     }
     Ok(())
 }

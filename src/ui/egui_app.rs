@@ -67,6 +67,7 @@ impl Layer {
 
 enum WorkerMsg {
     Progress(String, f32),
+    Log(String),
     Finished(Box<PipelineResult>, Box<QualityReport>),
     Failed(String),
 }
@@ -87,6 +88,8 @@ struct StereoEguiApp {
     chantier_dir: String,
     chantier_pair_idx: usize,
     chantier_roi_size: u32,
+    chantier_center_gcp: bool,
+    chantier_merge_voxel: f64,
     left_path: String,
     right_path: String,
     cam_left_path: String,
@@ -192,7 +195,9 @@ impl StereoEguiApp {
             report,
             chantier_dir: r"E:\Chantiers\MEYREUIL".to_string(),
             chantier_pair_idx: 0,
-            chantier_roi_size: 512,
+            chantier_roi_size: 1024,
+            chantier_center_gcp: false,
+            chantier_merge_voxel: 0.0,
             left_path: String::new(),
             right_path: String::new(),
             cam_left_path: String::new(),
@@ -295,12 +300,16 @@ impl StereoEguiApp {
 
     fn poll_worker(&mut self) {
         let mut done: Option<Result<(PipelineResult, QualityReport), String>> = None;
+        let mut pending_logs = Vec::new();
         if let Some(rx) = &self.worker_rx {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     WorkerMsg::Progress(s, p) => {
                         self.progress_text = s;
                         self.progress_frac = p;
+                    }
+                    WorkerMsg::Log(l) => {
+                        pending_logs.push(l);
                     }
                     WorkerMsg::Finished(res, rep) => {
                         done = Some(Ok((*res, *rep)));
@@ -310,6 +319,9 @@ impl StereoEguiApp {
                     }
                 }
             }
+        }
+        for l in pending_logs {
+            self.log(l);
         }
         if let Some(outcome) = done {
             self.worker_rx = None;
@@ -413,7 +425,12 @@ impl StereoEguiApp {
         }
         let idx = self.chantier_pair_idx.min(chantier.pairs.len() - 1);
         let pair = &chantier.pairs[idx];
-        match crate::core::chantier::prepare_stereo_pair_roi(&chantier, pair, self.chantier_roi_size) {
+        match crate::core::chantier::prepare_stereo_pair_roi_opts(
+            &chantier,
+            pair,
+            self.chantier_roi_size,
+            self.chantier_center_gcp,
+        ) {
             Ok(roi) => {
                 self.left = roi.left_img;
                 self.left_rgb = roi.left_rgb;
@@ -443,6 +460,148 @@ impl StereoEguiApp {
             }
             Err(e) => self.log(format!("GeoTIFF ROI error: {}", e)),
         }
+    }
+
+    fn run_chantier_all_pairs_and_merge(&mut self, ctx: &egui::Context) {
+        if self.is_running() {
+            return;
+        }
+        let dir = Path::new(self.chantier_dir.trim()).to_path_buf();
+        let chantier = match crate::core::chantier::Chantier::discover(&dir) {
+            Ok(c) => c,
+            Err(e) => {
+                self.log(format!("Chantier error: {}", e));
+                return;
+            }
+        };
+        if chantier.pairs.is_empty() {
+            self.log("No stereo pairs detected in chantier".to_string());
+            return;
+        }
+
+        self.cancel.reset();
+        let (tx, rx) = mpsc::channel();
+        self.worker_rx = Some(rx);
+        self.progress_frac = 0.01;
+        self.progress_text = format!("Merging {} chantier pairs...", chantier.pairs.len());
+
+        let engine = Arc::clone(&self.engine);
+        let base_job = self.job.clone();
+        let roi_size = self.chantier_roi_size;
+        let center_gcp = self.chantier_center_gcp;
+        let merge_voxel = self.chantier_merge_voxel;
+        let cancel = self.cancel.clone();
+        let repaint_ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let out_dir = dir.join("Output_stereopipeline");
+            if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                let _ = tx.send(WorkerMsg::Failed(format!("Cannot create output dir: {}", e)));
+                repaint_ctx.request_repaint();
+                return;
+            }
+            let merged_ply_path = out_dir.join("chantier_merged-PC.ply");
+            let mut merger = match crate::image::io::PointCloudMerger::new(&merged_ply_path, merge_voxel) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::Failed(format!("Cannot create merged PLY: {}", e)));
+                    repaint_ctx.request_repaint();
+                    return;
+                }
+            };
+
+            let total = chantier.pairs.len();
+            let mut last_out: Option<(PipelineResult, QualityReport)> = None;
+            for (i, pair) in chantier.pairs.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    let _ = tx.send(WorkerMsg::Failed("Cancelled by user".to_string()));
+                    repaint_ctx.request_repaint();
+                    return;
+                }
+                let pct = i as f32 / total as f32;
+                let _ = tx.send(WorkerMsg::Progress(
+                    format!("Pair {}/{}: {}", i + 1, total, pair.name),
+                    pct,
+                ));
+                repaint_ctx.request_repaint();
+
+                let roi = match crate::core::chantier::prepare_stereo_pair_roi_opts(
+                    &chantier,
+                    pair,
+                    roi_size,
+                    center_gcp,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(WorkerMsg::Log(format!("Pair {} skipped: {}", pair.name, e)));
+                        continue;
+                    }
+                };
+                let mut spec = base_job.clone();
+                spec.write_outputs = false;
+                spec.write_checkpoints = false;
+                spec.write_ply = false;
+                spec.settings.search_min_x = roi.search_box.0;
+                spec.settings.search_min_y = roi.search_box.1;
+                spec.settings.search_max_x = roi.search_box.2;
+                spec.settings.search_max_y = roi.search_box.3;
+
+                match WorkflowExecutor::execute_in_memory_with_rgb(
+                    &spec,
+                    &roi.left_img,
+                    roi.left_rgb.as_ref(),
+                    &roi.right_img,
+                    &roi.left_cam,
+                    &roi.right_cam,
+                    None,
+                    &engine,
+                    &cancel,
+                    |_| {},
+                ) {
+                    Ok(out) => {
+                        if let Err(e) = merger.add_point_cloud(&out.result.point_cloud) {
+                            let _ = tx.send(WorkerMsg::Failed(format!("PLY merge write error: {}", e)));
+                            repaint_ctx.request_repaint();
+                            return;
+                        }
+                        let _ = tx.send(WorkerMsg::Log(format!(
+                            "Merged {}/{}: {} ({:.1}%, {} pts)",
+                            i + 1,
+                            total,
+                            pair.name,
+                            out.report.valid_disparity_pct,
+                            out.report.valid_points
+                        )));
+                        last_out = Some((out.result, out.report));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(WorkerMsg::Failed(e.to_string()));
+                        repaint_ctx.request_repaint();
+                        return;
+                    }
+                }
+            }
+
+            match merger.finish() {
+                Ok(stats) => {
+                    let _ = tx.send(WorkerMsg::Log(format!(
+                        "Fused RGB f64 PLY saved: {} ({} pts, {:.1} MB)",
+                        merged_ply_path.display(),
+                        stats.vertex_count,
+                        stats.file_size_bytes as f64 / (1024.0 * 1024.0)
+                    )));
+                    if let Some((res, rep)) = last_out {
+                        let _ = tx.send(WorkerMsg::Finished(Box::new(res), Box::new(rep)));
+                    } else {
+                        let _ = tx.send(WorkerMsg::Failed("No pairs produced valid output".to_string()));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::Failed(format!("PLY finalize error: {}", e)));
+                }
+            }
+            repaint_ctx.request_repaint();
+        });
     }
 
     fn load_job_file(&mut self, ctx: &egui::Context) {
@@ -690,11 +849,27 @@ impl eframe::App for StereoEguiApp {
                                 ui.label("ROI 1:1");
                                 ui.add(egui::DragValue::new(&mut self.chantier_roi_size).range(128..=2048).speed(64));
                             });
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.chantier_center_gcp, "Center GCP");
+                                ui.label("Voxel (m)");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.chantier_merge_voxel)
+                                        .range(0.0..=5.0)
+                                        .speed(0.01)
+                                        .fixed_decimals(2),
+                                );
+                            });
                             if ui
                                 .add_enabled(!self.is_running(), egui::Button::new("Load & Run Chantier Pair (1:1 GeoTIFF)"))
                                 .clicked()
                             {
                                 self.load_chantier_pair(ctx);
+                            }
+                            if ui
+                                .add_enabled(!self.is_running(), egui::Button::new("Run All Pairs & Merge RGB PLY"))
+                                .clicked()
+                            {
+                                self.run_chantier_all_pairs_and_merge(ctx);
                             }
                         });
 
