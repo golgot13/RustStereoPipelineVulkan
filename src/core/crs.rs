@@ -1,6 +1,7 @@
 //! Pure-Rust double-precision (`f64`) Geodetic & Coordinate Reference System (CRS) engine.
 //! Supports Local Cartesian, WGS84 (EPSG:4326), ECEF (EPSG:4978), French Lambert-93 (EPSG:2154),
-//! UTM North/South zones (EPSG:326xx / 327xx), Moon, and Mars.
+//! French RGF93 Conic Conformal zones CC42..CC50 (EPSG:3942..3950), UTM North/South (EPSG:326xx / 327xx),
+//! Moon, and Mars.
 
 use crate::core::error::{PipelineError, Result};
 use crate::math::{Datum, Vec3};
@@ -11,6 +12,8 @@ pub enum CrsId {
     Wgs84,
     Ecef,
     Lambert93,
+    /// French RGF93 Conic Conformal 9 zones: zone in `42..=50` (`EPSG:3942..=3950`).
+    CcZone(u8),
     Utm { zone: u8, north: bool },
     Moon,
     Mars,
@@ -23,6 +26,7 @@ impl CrsId {
             Self::Wgs84 => "EPSG:4326".to_string(),
             Self::Ecef => "EPSG:4978".to_string(),
             Self::Lambert93 => "EPSG:2154".to_string(),
+            Self::CcZone(z) => format!("EPSG:{}", 3900 + (*z as u16)),
             Self::Utm { zone, north } => {
                 if *north {
                     format!("EPSG:326{:02}", zone)
@@ -41,6 +45,7 @@ impl CrsId {
             Self::Wgs84 => "WGS84 Geographic (EPSG:4326)".to_string(),
             Self::Ecef => "WGS84 ECEF (EPSG:4978)".to_string(),
             Self::Lambert93 => "RGF93 / Lambert-93 (EPSG:2154)".to_string(),
+            Self::CcZone(z) => format!("RGF93 / CC{} (EPSG:{})", z, 3900 + (*z as u16)),
             Self::Utm { zone, north } => format!(
                 "WGS84 / UTM Zone {}{} ({})",
                 zone,
@@ -62,6 +67,28 @@ impl CrsId {
             "2154" | "LAMBERT93" | "LAMBERT-93" | "L93" | "RGF93" => Ok(Self::Lambert93),
             "MOON" | "IAU:MOON" => Ok(Self::Moon),
             "MARS" | "IAU:MARS" => Ok(Self::Mars),
+            code if code.len() == 4 && code.starts_with("39") => {
+                let epsg: u16 = code
+                    .parse()
+                    .map_err(|_| PipelineError::Config(format!("Invalid CC EPSG code: {}", s)))?;
+                if (3942..=3950).contains(&epsg) {
+                    Ok(Self::CcZone((epsg - 3900) as u8))
+                } else {
+                    Err(PipelineError::Config(format!("Unsupported EPSG code '{}' (expected 3942..=3950)", s)))
+                }
+            }
+            code if code.starts_with("CC") => {
+                let z: u8 = code
+                    .trim_start_matches("CC")
+                    .trim_start_matches(['_', '-', ' '])
+                    .parse()
+                    .map_err(|_| PipelineError::Config(format!("Invalid CC zone: {}", s)))?;
+                if (42..=50).contains(&z) {
+                    Ok(Self::CcZone(z))
+                } else {
+                    Err(PipelineError::Config(format!("CC zone out of range 42..=50: {}", z)))
+                }
+            }
             code if code.len() == 5 && (code.starts_with("326") || code.starts_with("327")) => {
                 let north = code.starts_with("326");
                 let zone: u8 = code[3..]
@@ -101,6 +128,15 @@ impl CrsId {
             Self::Wgs84,
             Self::Ecef,
             Self::Lambert93,
+            Self::CcZone(42),
+            Self::CcZone(43),
+            Self::CcZone(44),
+            Self::CcZone(45),
+            Self::CcZone(46),
+            Self::CcZone(47),
+            Self::CcZone(48),
+            Self::CcZone(49),
+            Self::CcZone(50),
             Self::Utm { zone: 31, north: true },
             Self::Utm { zone: 32, north: true },
             Self::Utm { zone: 20, north: true },
@@ -111,19 +147,43 @@ impl CrsId {
     }
 }
 
-/// Exact GRS80/IGN Lambert-93 (`EPSG:2154`) parameters (IAG / IGN Alg0003 & Alg0004).
-mod lambert93 {
+/// Exact GRS80/IGN Lambert Conformal Conic 2SP engine (Lambert-93 EPSG:2154 & CC42..CC50 EPSG:3942..3950).
+mod lcc_grs80 {
     use crate::math::Vec3;
 
     const A: f64 = 6_378_137.0;
     const INV_F: f64 = 298.257_222_101;
     const E2: f64 = 2.0 / INV_F - 1.0 / (INV_F * INV_F);
-    const PHI_1_DEG: f64 = 44.0;
-    const PHI_2_DEG: f64 = 49.0;
-    const PHI_0_DEG: f64 = 46.5;
     const LON_0_DEG: f64 = 3.0;
-    const X_S: f64 = 700_000.0;
-    const Y_0: f64 = 6_600_000.0;
+
+    #[derive(Clone, Copy)]
+    pub struct LccDef {
+        pub phi1_deg: f64,
+        pub phi2_deg: f64,
+        pub phi0_deg: f64,
+        pub x0: f64,
+        pub y0: f64,
+    }
+
+    pub const LAMBERT93: LccDef = LccDef {
+        phi1_deg: 44.0,
+        phi2_deg: 49.0,
+        phi0_deg: 46.5,
+        x0: 700_000.0,
+        y0: 6_600_000.0,
+    };
+
+    /// Official IGN RGF93 Conic Conformal Zone `z` in `42..=50` (`EPSG:3942..=3950`).
+    pub fn cc_zone(z: u8) -> LccDef {
+        let lat0 = z as f64;
+        LccDef {
+            phi1_deg: lat0 - 0.75,
+            phi2_deg: lat0 + 0.75,
+            phi0_deg: lat0,
+            x0: 1_700_000.0,
+            y0: ((z as f64) - 41.0) * 1_000_000.0 + 200_000.0,
+        }
+    }
 
     #[inline]
     fn isometric_lat(phi: f64, e: f64) -> f64 {
@@ -132,11 +192,11 @@ mod lambert93 {
             - 0.5 * e * ((1.0 + s) / (1.0 - s)).ln()
     }
 
-    fn params() -> (f64, f64, f64, f64) {
+    fn params(def: LccDef) -> (f64, f64, f64, f64) {
         let e = E2.sqrt();
-        let phi1 = PHI_1_DEG.to_radians();
-        let phi2 = PHI_2_DEG.to_radians();
-        let phi0 = PHI_0_DEG.to_radians();
+        let phi1 = def.phi1_deg.to_radians();
+        let phi2 = def.phi2_deg.to_radians();
+        let phi0 = def.phi0_deg.to_radians();
         let l1 = isometric_lat(phi1, e);
         let l2 = isometric_lat(phi2, e);
         let l0 = isometric_lat(phi0, e);
@@ -145,33 +205,32 @@ mod lambert93 {
         let w2 = (1.0 - E2 * phi2.sin().powi(2)).sqrt();
         let n = ((phi2.cos() / w2) / (phi1.cos() / w1)).ln() / (l1 - l2);
         let c = (A * phi1.cos() / (n * w1)) * (n * l1).exp();
-        let y_s = Y_0 + c * (-n * l0).exp();
+        let y_s = def.y0 + c * (-n * l0).exp();
         (e, n, c, y_s)
     }
 
-    /// `(lon_deg, lat_deg, h_m) -> (Easting_m, Northing_m, h_m)` in EPSG:2154.
-    pub fn forward(llh: Vec3) -> Vec3 {
-        let (e, n, c, y_s) = params();
+    /// `(lon_deg, lat_deg, h_m) -> (Easting_m, Northing_m, h_m)`.
+    pub fn forward(llh: Vec3, def: LccDef) -> Vec3 {
+        let (e, n, c, y_s) = params(def);
         let lon = llh.x.to_radians();
         let lat = llh.y.to_radians();
         let lon0 = LON_0_DEG.to_radians();
         let l = isometric_lat(lat, e);
         let r = c * (-n * l).exp();
         let gamma = n * (lon - lon0);
-        Vec3::new(X_S + r * gamma.sin(), y_s - r * gamma.cos(), llh.z)
+        Vec3::new(def.x0 + r * gamma.sin(), y_s - r * gamma.cos(), llh.z)
     }
 
-    /// `(Easting_m, Northing_m, h_m) -> (lon_deg, lat_deg, h_m)` from EPSG:2154.
-    pub fn inverse(enh: Vec3) -> Vec3 {
-        let (e, n, c, y_s) = params();
-        let dx = enh.x - X_S;
+    /// `(Easting_m, Northing_m, h_m) -> (lon_deg, lat_deg, h_m)`.
+    pub fn inverse(enh: Vec3, def: LccDef) -> Vec3 {
+        let (e, n, c, y_s) = params(def);
+        let dx = enh.x - def.x0;
         let dy = y_s - enh.y;
         let r = dx.hypot(dy);
         let gamma = dx.atan2(dy);
         let lon = LON_0_DEG.to_radians() + gamma / n;
         let l = -(r / c).ln() / n;
 
-        // Iterative inverse isometric latitude (converges to < 1e-13 rad in 6 iterations)
         let mut phi = 2.0 * l.exp().atan() - std::f64::consts::FRAC_PI_2;
         for _ in 0..10 {
             let s = e * phi.sin();
@@ -300,7 +359,8 @@ pub fn transform_point(src: CrsId, dst: CrsId, p: Vec3) -> Result<Vec3> {
     let wgs = match src {
         CrsId::Wgs84 => p,
         CrsId::Ecef => Datum::WGS84.ecef_to_geodetic(p),
-        CrsId::Lambert93 => lambert93::inverse(p),
+        CrsId::Lambert93 => lcc_grs80::inverse(p, lcc_grs80::LAMBERT93),
+        CrsId::CcZone(z) => lcc_grs80::inverse(p, lcc_grs80::cc_zone(z)),
         CrsId::Utm { zone, north } => utm::inverse(p, zone, north),
         _ => unreachable!(),
     };
@@ -309,7 +369,8 @@ pub fn transform_point(src: CrsId, dst: CrsId, p: Vec3) -> Result<Vec3> {
     let out = match dst {
         CrsId::Wgs84 => wgs,
         CrsId::Ecef => Datum::WGS84.geodetic_to_ecef(wgs.x, wgs.y, wgs.z),
-        CrsId::Lambert93 => lambert93::forward(wgs),
+        CrsId::Lambert93 => lcc_grs80::forward(wgs, lcc_grs80::LAMBERT93),
+        CrsId::CcZone(z) => lcc_grs80::forward(wgs, lcc_grs80::cc_zone(z)),
         CrsId::Utm { zone, north } => utm::forward(wgs, zone, north),
         _ => unreachable!(),
     };
@@ -332,6 +393,39 @@ mod tests {
         assert!((back.x - wgs.x).abs() < 1e-8);
         assert!((back.y - wgs.y).abs() < 1e-8);
         assert!((back.z - wgs.z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cc44_epsg3944_meyreuil_roundtrip() {
+        assert_eq!(CrsId::parse("EPSG:3944").unwrap(), CrsId::CcZone(44));
+        assert_eq!(CrsId::parse("3944").unwrap(), CrsId::CcZone(44));
+        assert_eq!(CrsId::parse("CC44").unwrap(), CrsId::CcZone(44));
+        assert_eq!(CrsId::CcZone(44).code(), "EPSG:3944");
+
+        // Meyreuil (Bouches-du-Rhône): lon ≈ 5.493°E, lat ≈ 43.481°N, h = 240.0 m
+        let wgs = Vec3::new(5.493, 43.481, 240.0);
+        let cc44 = transform_point(CrsId::Wgs84, CrsId::CcZone(44), wgs).unwrap();
+        assert!(
+            (cc44.x - 1_901_700.0).abs() < 1_000.0,
+            "Unexpected CC44 Easting: {}",
+            cc44.x
+        );
+        assert!(
+            (cc44.y - 3_145_000.0).abs() < 5_000.0,
+            "Unexpected CC44 Northing: {}",
+            cc44.y
+        );
+
+        let back = transform_point(CrsId::CcZone(44), CrsId::Wgs84, cc44).unwrap();
+        assert!((back.x - wgs.x).abs() < 1e-8);
+        assert!((back.y - wgs.y).abs() < 1e-8);
+        assert!((back.z - wgs.z).abs() < 1e-6);
+
+        // Cross-check EPSG:3944 <-> EPSG:2154 (Lambert-93)
+        let l93 = transform_point(CrsId::CcZone(44), CrsId::Lambert93, cc44).unwrap();
+        let back_cc44 = transform_point(CrsId::Lambert93, CrsId::CcZone(44), l93).unwrap();
+        assert!((back_cc44.x - cc44.x).abs() < 1e-4);
+        assert!((back_cc44.y - cc44.y).abs() < 1e-4);
     }
 
     #[test]

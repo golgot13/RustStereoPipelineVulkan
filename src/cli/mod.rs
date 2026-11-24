@@ -94,7 +94,7 @@ COMMANDS:
   disparitydebug <input.tif|pfm> <out_prefix>
       Render a colorized PNG preview of a raster (disparity/DEM/error)
   crs-convert --src <CRS> --dst <CRS> --x <X> --y <Y> --z <Z>
-      Reproject a 3D point in double precision f64 (WGS84, ECEF, Lambert-93 EPSG:2154, UTM)
+      Reproject a 3D point in double precision f64 (WGS84, ECEF, Lambert-93, CC42..CC50, UTM)
   list-crs
       List supported Coordinate Reference Systems
   vulkan-info
@@ -115,7 +115,7 @@ SCRIPTING & ROBUSTNESS OPTIONS:
   --to-stage <stage>             End stage:   pprc|corr|rfne|fltr|tri|dem (0..5)
   --tile-size <N>                Full-Scale 1:1 sliding-window tile size (default: auto)
   --profile <tier>               Hardware RAM tier: compact | standard | workstation
-  --crs <code|name>              Output CRS: LOCAL | EPSG:4326 | EPSG:2154 | EPSG:32631 | IAU:MOON | IAU:MARS
+  --crs <code|name>              Output CRS: LOCAL | EPSG:4326 | EPSG:2154 | EPSG:3942..3950 (CC42..CC50) | EPSG:32631 | IAU:MOON | IAU:MARS
   --continue-on-error            In batch mode, continue running remaining jobs on failure
 
 STEREO OPTIONS:
