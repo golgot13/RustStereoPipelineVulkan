@@ -131,15 +131,20 @@ pub fn parse_trajectory_str(content: &str) -> Result<Vec<ImagePose>> {
     let delimiter = detect_delimiter(content);
     let mut poses = Vec::new();
     let mut header_map: Option<HashMap<String, usize>> = None;
+    let mut header_declares_gons = false;
 
     for raw in content.lines() {
         let line = raw.trim();
-        if line.is_empty()
-            || line.starts_with('#')
-            || line.starts_with("//")
-            || line.starts_with('[')
-            || line.starts_with("CAMDIST;")
-        {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('#') || line.starts_with("//") || line.starts_with('[') {
+            if line_declares_gons(line) {
+                header_declares_gons = true;
+            }
+            continue;
+        }
+        if line.starts_with("CAMDIST;") {
             continue;
         }
         let low = line.to_ascii_lowercase();
@@ -165,6 +170,9 @@ pub fn parse_trajectory_str(content: &str) -> Result<Vec<ImagePose>> {
                 )
             });
             if has_header {
+                if line_declares_gons(line) {
+                    header_declares_gons = true;
+                }
                 let mut m = HashMap::new();
                 for (i, &p) in parts.iter().enumerate() {
                     m.insert(p.to_ascii_lowercase(), i);
@@ -224,13 +232,10 @@ pub fn parse_trajectory_str(content: &str) -> Result<Vec<ImagePose>> {
             }
         };
 
-        // Normalize micro-degrees and gons -> degrees (AEROPHOTOGRAM rules)
+        // Normalize micro-degrees -> degrees
         if omega.abs() > 10_000.0 { omega /= 1_000_000.0; }
         if phi.abs() > 10_000.0 { phi /= 1_000_000.0; }
         if kappa.abs() > 10_000.0 { kappa /= 1_000_000.0; }
-        if omega.abs() > 90.0 && omega.abs() <= 400.0 { omega *= 0.9; }
-        if phi.abs() > 90.0 && phi.abs() <= 400.0 { phi *= 0.9; }
-        if kappa.abs() > 90.0 && kappa.abs() <= 400.0 { kappa *= 0.9; }
 
         poses.push(ImagePose {
             id,
@@ -246,7 +251,36 @@ pub fn parse_trajectory_str(content: &str) -> Result<Vec<ImagePose>> {
     if poses.is_empty() {
         return Err(PipelineError::Format("No valid trajectory poses found".into()));
     }
+
+    // File-level gons -> degrees conversion ONLY if explicitly declared in header/comment
+    // or if any angle lies in (360, 400] (impossible in degrees). Never corrupt degree
+    // trajectories with |kappa| in (90, 360] (such as reverse flight lines at kappa ~ +/-180 deg).
+    let file_uses_gons = header_declares_gons
+        || poses.iter().any(|p| {
+            is_strictly_gon_range(p.omega_deg)
+                || is_strictly_gon_range(p.phi_deg)
+                || is_strictly_gon_range(p.kappa_deg)
+        });
+    if file_uses_gons {
+        for p in &mut poses {
+            p.omega_deg *= 0.9;
+            p.phi_deg *= 0.9;
+            p.kappa_deg *= 0.9;
+        }
+    }
+
     Ok(poses)
+}
+
+#[inline]
+fn is_strictly_gon_range(angle: f64) -> bool {
+    let a = angle.abs();
+    a > 360.0 && a <= 400.0
+}
+
+fn line_declares_gons(line: &str) -> bool {
+    line.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| matches!(tok.to_ascii_lowercase().as_str(), "gon" | "gons" | "grad" | "grads" | "grade" | "grades"))
 }
 
 fn detect_delimiter(content: &str) -> char {
@@ -1281,5 +1315,47 @@ mod tests {
         assert!((rep.samples[0].z_dem - 228.5).abs() < 1e-4);
         assert!((rep.dz_bias_m - 0.25).abs() < 1e-4);
         assert!((rep.dz_rmse_m - 0.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_trajectory_reverse_flight_line_kappa_degrees_preserved() {
+        // Flight line L0 (kappa ~ 0 deg) + reverse line L2 (kappa ~ +/-180 deg, 90.1 deg, 270 deg)
+        // Must NEVER be multiplied by 0.9!
+        let traj = "\
+# Meyreuil polygon survey (degrees)
+025_0709 1901500.0 3145000.0 2030.0 0.35 -0.28 0.42
+026_0731 1902200.0 3146000.0 2031.0 -0.15 0.22 179.80
+026_0732 1902201.0 3145750.0 2030.5 0.11 -0.19 -179.40
+026_0733 1902202.0 3145500.0 2030.2 0.05 0.08 90.10
+026_0734 1902203.0 3145250.0 2030.1 -0.04 0.03 270.00
+";
+        let poses = parse_trajectory_str(traj).unwrap();
+        assert_eq!(poses.len(), 5);
+        assert!((poses[0].kappa_deg - 0.42).abs() < 1e-9);
+        assert!((poses[1].kappa_deg - 179.80).abs() < 1e-9);
+        assert!((poses[2].kappa_deg - (-179.40)).abs() < 1e-9);
+        assert!((poses[3].kappa_deg - 90.10).abs() < 1e-9);
+        assert!((poses[4].kappa_deg - 270.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_trajectory_file_level_gons_conversion() {
+        let traj_header = "\
+# Units: gons
+IMG_1 1901500.0 3145000.0 2030.0 0.50 -0.40 200.00
+IMG_2 1901500.0 3145250.0 2030.0 0.10 0.20 100.00
+";
+        let p_hdr = parse_trajectory_str(traj_header).unwrap();
+        assert!((p_hdr[0].kappa_deg - 180.0).abs() < 1e-9);
+        assert!((p_hdr[0].omega_deg - 0.45).abs() < 1e-9);
+        assert!((p_hdr[1].kappa_deg - 90.0).abs() < 1e-9);
+
+        let traj_gt360 = "\
+IMG_1 1901500.0 3145000.0 2030.0 0.50 -0.40 398.00
+IMG_2 1901500.0 3145250.0 2030.0 0.10 0.20 200.00
+";
+        let p_gt = parse_trajectory_str(traj_gt360).unwrap();
+        assert!((p_gt[0].kappa_deg - 358.2).abs() < 1e-9);
+        assert!((p_gt[1].kappa_deg - 180.0).abs() < 1e-9);
     }
 }
