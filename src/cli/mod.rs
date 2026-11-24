@@ -13,7 +13,7 @@ use crate::config::{
 };
 use crate::core::cancel::CancellationToken;
 use crate::core::chantier::{
-    chantier_summary_json, prepare_stereo_pair_roi, validate_dem_against_gcps, Chantier,
+    chantier_summary_json, prepare_stereo_pair_roi_opts, validate_dem_against_gcps, Chantier,
 };
 use crate::core::crs::{transform_point, CrsId};
 use crate::core::error::{PipelineError, Result};
@@ -163,6 +163,8 @@ struct ParsedArgs {
     pair_idx: Option<usize>,
     all_pairs: bool,
     roi_size: u32,
+    center_gcp: bool,
+    custom_search: bool,
 }
 
 fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
@@ -194,6 +196,8 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
     let mut pair_idx = None;
     let mut all_pairs = false;
     let mut roi_size = 1024u32;
+    let mut center_gcp = false;
+    let mut custom_search = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -237,6 +241,7 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
                 settings.search_min_y = args[i + 2].parse().map_err(|_| PipelineError::Cli("Invalid search minY".into()))?;
                 settings.search_max_x = args[i + 3].parse().map_err(|_| PipelineError::Cli("Invalid search maxX".into()))?;
                 settings.search_max_y = args[i + 4].parse().map_err(|_| PipelineError::Cli("Invalid search maxY".into()))?;
+                custom_search = true;
                 i += 4;
             }
             "--subpixel-mode" => {
@@ -294,6 +299,7 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
                 pair_idx = Some(next(&mut i, a)?.parse().map_err(|_| PipelineError::Cli("Invalid --pair index".into()))?);
             }
             "--all-pairs" => all_pairs = true,
+            "--center-gcp" => center_gcp = true,
             "--roi-size" => {
                 roi_size = next(&mut i, a)?.parse::<u32>().map_err(|_| PipelineError::Cli("Invalid --roi-size".into()))?.clamp(128, 4096);
             }
@@ -335,6 +341,8 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
         pair_idx,
         all_pairs,
         roi_size,
+        center_gcp,
+        custom_search,
     })
 }
 
@@ -489,24 +497,51 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
             println!("  Right : {}", pair.right_image_path.display());
         }
 
-        let roi = prepare_stereo_pair_roi(&chantier, pair, p.roi_size)?;
+        let roi = prepare_stereo_pair_roi_opts(&chantier, pair, p.roi_size, p.center_gcp)?;
+        let eff_search = if p.custom_search {
+            (
+                p.settings.search_min_x,
+                p.settings.search_min_y,
+                p.settings.search_max_x,
+                p.settings.search_max_y,
+            )
+        } else {
+            roi.search_box
+        };
         if !p.ndjson {
             println!(
-                "  Capteur natif : {}x{} px | ROI L=({},{}) R=({},{}) | Search X=[{}..{}] Y=[{}..{}]",
+                "  Capteur natif : {}x{} px | Patch L=({},{},{}x{}) R=({},{},{}x{})",
                 roi.full_dims.0,
                 roi.full_dims.1,
                 roi.left_roi.0,
                 roi.left_roi.1,
+                roi.left_roi.2,
+                roi.left_roi.3,
                 roi.right_roi.0,
                 roi.right_roi.1,
-                roi.search_box.0,
-                roi.search_box.2,
-                roi.search_box.1,
-                roi.search_box.3
+                roi.right_roi.2,
+                roi.right_roi.3,
+            );
+            let anchor_str = match roi.anchored_gcp {
+                Some(ref gid) => format!("GCP {} (Z={:.2} m)", gid, roi.ground_z_ref),
+                None => format!("Z_ref={:.2} m", roi.ground_z_ref),
+            };
+            println!(
+                "  Épipolaire    : Fusiello rectifié (dy=0) | {} | dx_coarse={:+} px | Search X=[{}..{}] Y=[{}..{}]",
+                anchor_str,
+                roi.coarse_dx_px,
+                eff_search.0,
+                eff_search.2,
+                eff_search.1,
+                eff_search.3
             );
         }
 
-        // Export cropped ASP .tsai cameras & ROI GeoTIFFs for full reproducibility
+        // Export rectified 1:1 ROI GeoTIFFs & exact ASP .tsai cameras for 100% CLI reproducibility
+        let rect_l_path = format!("{}-rect-L.tif", out_prefix);
+        let rect_r_path = format!("{}-rect-R.tif", out_prefix);
+        save_tiff_f32(Path::new(&rect_l_path), &roi.left_img, None)?;
+        save_tiff_f32(Path::new(&rect_r_path), &roi.right_img, None)?;
         if let AnyCamera::Pinhole(ref cl) = roi.left_cam {
             cl.save_tsai(Path::new(&format!("{}-cam-L.tsai", out_prefix)))?;
         }
@@ -517,17 +552,17 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         let mut spec = build_spec(
             &p,
             JobInput::Files {
-                left_image: pair.left_image_path.to_string_lossy().into_owned(),
-                right_image: pair.right_image_path.to_string_lossy().into_owned(),
+                left_image: rect_l_path,
+                right_image: rect_r_path,
                 left_camera: format!("{}-cam-L.tsai", out_prefix),
                 right_camera: format!("{}-cam-R.tsai", out_prefix),
             },
             out_prefix.clone(),
         );
-        spec.settings.search_min_x = roi.search_box.0;
-        spec.settings.search_min_y = roi.search_box.1;
-        spec.settings.search_max_x = roi.search_box.2;
-        spec.settings.search_max_y = roi.search_box.3;
+        spec.settings.search_min_x = eff_search.0;
+        spec.settings.search_min_y = eff_search.1;
+        spec.settings.search_max_x = eff_search.2;
+        spec.settings.search_max_y = eff_search.3;
         spec.save_file(Path::new(&format!("{}-job.json", out_prefix)))?;
 
         let out = WorkflowExecutor::execute_in_memory(
