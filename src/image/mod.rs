@@ -1,5 +1,6 @@
 //! Core raster image, disparity map, DEM grid, point cloud, and colormap structures.
 
+pub mod geotiff;
 pub mod io;
 
 use crate::math::Vec3;

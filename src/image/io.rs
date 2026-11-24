@@ -14,16 +14,19 @@ use std::path::Path;
 use super::{Colormap, DisparityMap, ImageF32, PointCloud};
 
 /// Load a grayscale f32 image by inspecting file magic bytes / extension.
+/// Supports Classic TIFF & BigTIFF (Uncompressed, LZW, Deflate, PackBits, Strip & Tiled), PFM, PGM/PPM, BMP.
 pub fn load_image(path: &Path) -> io::Result<ImageF32> {
     let mut f = File::open(path)?;
-    let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)?;
-    if bytes.len() < 4 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "File too short"));
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)?;
+    if &magic[0..2] == b"II" || &magic[0..2] == b"MM" {
+        return crate::image::geotiff::GeoTiffReader::open(path)
+            .and_then(|r| r.read_full())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
     }
-    if &bytes[0..2] == b"II" || &bytes[0..2] == b"MM" {
-        decode_tiff(&bytes)
-    } else if &bytes[0..2] == b"Pf" || &bytes[0..2] == b"PF" {
+    let mut bytes = Vec::from(magic);
+    f.read_to_end(&mut bytes)?;
+    if &bytes[0..2] == b"Pf" || &bytes[0..2] == b"PF" {
         decode_pfm(&bytes)
     } else if &bytes[0..2] == b"P5" || &bytes[0..2] == b"P6" || &bytes[0..2] == b"P2" {
         decode_pnm(&bytes)

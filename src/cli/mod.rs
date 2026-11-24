@@ -12,6 +12,9 @@ use crate::config::{
     ComputeBackendPreference, CostMode, PrefilterMode, StereoAlgorithm, StereoSettings, SubpixelMode,
 };
 use crate::core::cancel::CancellationToken;
+use crate::core::chantier::{
+    chantier_summary_json, prepare_stereo_pair_roi, validate_dem_against_gcps, Chantier,
+};
 use crate::core::crs::{transform_point, CrsId};
 use crate::core::error::{PipelineError, Result};
 use crate::core::hardware::{HardwareProfile, ProfileTier};
@@ -39,6 +42,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
 
     match cmd {
         "stereo" => cmd_stereo(rest),
+        "chantier" => cmd_chantier(rest),
         "run" => cmd_run_job(rest),
         "batch" => cmd_batch(rest),
         "stereo_pprc" => cmd_pprc(rest),
@@ -70,6 +74,9 @@ USAGE:
   stereo-pipeline <COMMAND> [ARGS...] [OPTIONS...]
 
 COMMANDS:
+  chantier <chantier_dir> [--output <dir>] [--pair N | --all-pairs] [--roi-size 1024]
+      Auto-discover .CAM, trajectory .TXT, GCP, and GeoTIFF stereo pairs (e.g. Meyreuil DMC-IV 433Mpx)
+      and run streaming Full-Scale 1:1 stereo reconstruction into Output_stereopipeline
   stereo <L.tif> <R.tif> <L.tsai|rpb> <R.tsai|rpb> <out_prefix>
       Run full 5-stage DAG Stereo Pipeline (pprc -> corr -> rfne -> fltr -> tri -> point2dem)
   run --job <mission.json | ->
@@ -152,6 +159,10 @@ struct ParsedArgs {
     coord_x: f64,
     coord_y: f64,
     coord_z: f64,
+    output_dir: Option<String>,
+    pair_idx: Option<usize>,
+    all_pairs: bool,
+    roi_size: u32,
 }
 
 fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
@@ -179,6 +190,10 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
     let mut coord_x = 0.0;
     let mut coord_y = 0.0;
     let mut coord_z = 0.0;
+    let mut output_dir = None;
+    let mut pair_idx = None;
+    let mut all_pairs = false;
+    let mut roi_size = 1024u32;
 
     let mut i = 0;
     while i < args.len() {
@@ -274,6 +289,14 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
             "--x" => coord_x = next(&mut i, a)?.parse().map_err(|_| PipelineError::Cli("Invalid --x".into()))?,
             "--y" => coord_y = next(&mut i, a)?.parse().map_err(|_| PipelineError::Cli("Invalid --y".into()))?,
             "--z" => coord_z = next(&mut i, a)?.parse().map_err(|_| PipelineError::Cli("Invalid --z".into()))?,
+            "-o" | "--output" => output_dir = Some(next(&mut i, a)?.to_string()),
+            "--pair" => {
+                pair_idx = Some(next(&mut i, a)?.parse().map_err(|_| PipelineError::Cli("Invalid --pair index".into()))?);
+            }
+            "--all-pairs" => all_pairs = true,
+            "--roi-size" => {
+                roi_size = next(&mut i, a)?.parse::<u32>().map_err(|_| PipelineError::Cli("Invalid --roi-size".into()))?.clamp(128, 4096);
+            }
             "--benchmark" => {}
             other if other.starts_with('-') && other != "-" => {
                 return Err(PipelineError::Cli(format!("Unknown option: {}", other)));
@@ -308,6 +331,10 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
         coord_x,
         coord_y,
         coord_z,
+        output_dir,
+        pair_idx,
+        all_pairs,
+        roi_size,
     })
 }
 
@@ -379,6 +406,182 @@ fn cmd_stereo(args: &[String]) -> Result<()> {
     let out = WorkflowExecutor::execute_job(&spec, &engine, &cancel, |ev| emit_event(&ev, p.ndjson))?;
     if !p.ndjson {
         println!("\n{}", out.report.to_text());
+    }
+    Ok(())
+}
+
+fn cmd_chantier(args: &[String]) -> Result<()> {
+    let p = parse_common_args(args)?;
+    let chantier_dir = p
+        .positionals
+        .first()
+        .ok_or_else(|| {
+            PipelineError::Cli(
+                "Usage: chantier <chantier_dir> [--output <dir>] [--pair N | --all-pairs] [--roi-size 1024]".into(),
+            )
+        })?;
+
+    let root_path = Path::new(chantier_dir);
+    let out_dir = p
+        .output_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root_path.join("Output_stereopipeline"));
+    std::fs::create_dir_all(&out_dir)?;
+
+    let chantier = Chantier::discover(root_path)?;
+    if !p.ndjson {
+        println!("=== Chantier Aérien Découvert ===");
+        println!("  Répertoire   : {}", chantier.input_dir.display());
+        println!(
+            "  Caméra .CAM  : {} ({}x{} px, f={:.2} mm, pitch={:.4} mm)",
+            chantier.calibration.name,
+            chantier.calibration.width_px,
+            chantier.calibration.height_px,
+            chantier.calibration.focal_mm,
+            chantier.calibration.pixel_size_mm
+        );
+        println!("  Trajectoire  : {} ({} poses)", chantier.trajectory_file.display(), chantier.poses.len());
+        println!("  GCP Terrain  : {} points", chantier.gcps.len());
+        println!("  Paires Stéréo: {} paires détectées par ligne de vol", chantier.pairs.len());
+        println!("  Sortie       : {}", out_dir.display());
+    }
+
+    if chantier.pairs.is_empty() {
+        return Err(PipelineError::Geometry("No consecutive stereo pairs detected in chantier".into()));
+    }
+
+    let selected: Vec<usize> = if p.all_pairs {
+        (0..chantier.pairs.len()).collect()
+    } else {
+        let idx = p.pair_idx.unwrap_or(0);
+        if idx >= chantier.pairs.len() {
+            return Err(PipelineError::Cli(format!(
+                "Pair index {} out of range (0..{})",
+                idx,
+                chantier.pairs.len()
+            )));
+        }
+        vec![idx]
+    };
+
+    let engine = StereoPipelineEngine::new(p.settings.backend);
+    let cancel = CancellationToken::new();
+    let mut pair_summaries = Vec::new();
+
+    for idx in selected {
+        let pair = &chantier.pairs[idx];
+        let pair_dir = out_dir.join(&pair.name);
+        std::fs::create_dir_all(&pair_dir)?;
+        let out_prefix = pair_dir.join(&pair.name).to_string_lossy().into_owned();
+
+        if !p.ndjson {
+            println!(
+                "\n--- Paire {}/{} : {} (baseline={:.1} m, ROI 1:1 {}x{}) ---",
+                idx + 1,
+                chantier.pairs.len(),
+                pair.name,
+                pair.baseline_m,
+                p.roi_size,
+                p.roi_size
+            );
+            println!("  Left  : {}", pair.left_image_path.display());
+            println!("  Right : {}", pair.right_image_path.display());
+        }
+
+        let roi = prepare_stereo_pair_roi(&chantier, pair, p.roi_size)?;
+        if !p.ndjson {
+            println!(
+                "  Capteur natif : {}x{} px | ROI L=({},{}) R=({},{}) | Search X=[{}..{}] Y=[{}..{}]",
+                roi.full_dims.0,
+                roi.full_dims.1,
+                roi.left_roi.0,
+                roi.left_roi.1,
+                roi.right_roi.0,
+                roi.right_roi.1,
+                roi.search_box.0,
+                roi.search_box.2,
+                roi.search_box.1,
+                roi.search_box.3
+            );
+        }
+
+        // Export cropped ASP .tsai cameras & ROI GeoTIFFs for full reproducibility
+        if let AnyCamera::Pinhole(ref cl) = roi.left_cam {
+            cl.save_tsai(Path::new(&format!("{}-cam-L.tsai", out_prefix)))?;
+        }
+        if let AnyCamera::Pinhole(ref cr) = roi.right_cam {
+            cr.save_tsai(Path::new(&format!("{}-cam-R.tsai", out_prefix)))?;
+        }
+
+        let mut spec = build_spec(
+            &p,
+            JobInput::Files {
+                left_image: pair.left_image_path.to_string_lossy().into_owned(),
+                right_image: pair.right_image_path.to_string_lossy().into_owned(),
+                left_camera: format!("{}-cam-L.tsai", out_prefix),
+                right_camera: format!("{}-cam-R.tsai", out_prefix),
+            },
+            out_prefix.clone(),
+        );
+        spec.settings.search_min_x = roi.search_box.0;
+        spec.settings.search_min_y = roi.search_box.1;
+        spec.settings.search_max_x = roi.search_box.2;
+        spec.settings.search_max_y = roi.search_box.3;
+        spec.save_file(Path::new(&format!("{}-job.json", out_prefix)))?;
+
+        let out = WorkflowExecutor::execute_in_memory(
+            &spec,
+            &roi.left_img,
+            &roi.right_img,
+            &roi.left_cam,
+            &roi.right_cam,
+            None,
+            &engine,
+            &cancel,
+            |ev| emit_event(&ev, p.ndjson),
+        )?;
+
+        // Export colorized PNG previews for instant visual inspection
+        let dem_png = encode_png_rgba(
+            out.result.dem.elevation.width,
+            out.result.dem.elevation.height,
+            &out.result.dem.elevation.to_rgba8(p.cmap),
+        );
+        std::fs::write(format!("{}-DEM-preview.png", out_prefix), dem_png)?;
+        let hs_png = encode_png_rgba(
+            out.result.dem.hillshade.width,
+            out.result.dem.hillshade.height,
+            &out.result.dem.hillshade.to_rgba8(Colormap::Grayscale),
+        );
+        std::fs::write(format!("{}-HILLSHADE-preview.png", out_prefix), hs_png)?;
+        let disp_img = out.result.disp_filtered.dx_image();
+        let disp_png = encode_png_rgba(disp_img.width, disp_img.height, &disp_img.to_rgba8(p.cmap));
+        std::fs::write(format!("{}-DISP-preview.png", out_prefix), disp_png)?;
+
+        let gcp_val = validate_dem_against_gcps(&out.result.dem, &chantier.gcps);
+        if !p.ndjson {
+            println!("\n{}", out.report.to_text());
+            if gcp_val.matched_gcps > 0 {
+                println!(
+                    "  Validation GCP ({} points dans le DEM) : biais dZ={:+.3} m | RMSE dZ={:.3} m | max={:.3} m",
+                    gcp_val.matched_gcps, gcp_val.dz_bias_m, gcp_val.dz_rmse_m, gcp_val.dz_max_abs_m
+                );
+            }
+        }
+        pair_summaries.push((
+            pair.name.clone(),
+            out.result.timings.total_ms,
+            out.report.valid_disparity_pct,
+            out.report.valid_points,
+            gcp_val,
+        ));
+    }
+
+    let summary_path = out_dir.join("chantier_summary.json");
+    std::fs::write(&summary_path, chantier_summary_json(&chantier, &pair_summaries))?;
+    if !p.ndjson {
+        println!("\n=== Chantier terminé — Résumé enregistré dans {} ===", summary_path.display());
     }
     Ok(())
 }

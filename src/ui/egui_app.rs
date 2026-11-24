@@ -83,6 +83,9 @@ struct StereoEguiApp {
     report: Option<QualityReport>,
 
     // File path inputs
+    chantier_dir: String,
+    chantier_pair_idx: usize,
+    chantier_roi_size: u32,
     left_path: String,
     right_path: String,
     cam_left_path: String,
@@ -185,6 +188,9 @@ impl StereoEguiApp {
             job,
             result,
             report,
+            chantier_dir: r"E:\Chantiers\MEYREUIL".to_string(),
+            chantier_pair_idx: 0,
+            chantier_roi_size: 512,
             left_path: String::new(),
             right_path: String::new(),
             cam_left_path: String::new(),
@@ -384,6 +390,52 @@ impl StereoEguiApp {
         };
         self.log("Loaded custom stereo pair & cameras".to_string());
         self.trigger_pipeline_run(ctx);
+    }
+
+    fn load_chantier_pair(&mut self, ctx: &egui::Context) {
+        let dir = Path::new(self.chantier_dir.trim());
+        let chantier = match crate::core::chantier::Chantier::discover(dir) {
+            Ok(c) => c,
+            Err(e) => {
+                self.log(format!("Chantier error: {}", e));
+                return;
+            }
+        };
+        if chantier.pairs.is_empty() {
+            self.log("No stereo pairs detected in chantier".to_string());
+            return;
+        }
+        let idx = self.chantier_pair_idx.min(chantier.pairs.len() - 1);
+        let pair = &chantier.pairs[idx];
+        match crate::core::chantier::prepare_stereo_pair_roi(&chantier, pair, self.chantier_roi_size) {
+            Ok(roi) => {
+                self.left = roi.left_img;
+                self.right = roi.right_img;
+                self.cam_left = roi.left_cam;
+                self.cam_right = roi.right_cam;
+                self.job.output_prefix = dir
+                    .join("Output_stereopipeline")
+                    .join(&pair.name)
+                    .to_string_lossy()
+                    .into_owned();
+                self.job.settings.search_min_x = roi.search_box.0;
+                self.job.settings.search_min_y = roi.search_box.1;
+                self.job.settings.search_max_x = roi.search_box.2;
+                self.job.settings.search_max_y = roi.search_box.3;
+                self.log(format!(
+                    "Loaded chantier pair {}/{}: {} ({}x{} 1:1 ROI from {}x{})",
+                    idx + 1,
+                    chantier.pairs.len(),
+                    pair.name,
+                    self.left.width,
+                    self.left.height,
+                    roi.full_dims.0,
+                    roi.full_dims.1
+                ));
+                self.trigger_pipeline_run(ctx);
+            }
+            Err(e) => self.log(format!("GeoTIFF ROI error: {}", e)),
+        }
     }
 
     fn load_job_file(&mut self, ctx: &egui::Context) {
@@ -617,6 +669,27 @@ impl eframe::App for StereoEguiApp {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("Pipeline Parameters");
                     ui.separator();
+
+                    egui::CollapsingHeader::new("Chantier Aérien (.CAM + Traj + GeoTIFF)")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Dir");
+                                ui.text_edit_singleline(&mut self.chantier_dir);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Pair #");
+                                ui.add(egui::DragValue::new(&mut self.chantier_pair_idx).range(0..=500));
+                                ui.label("ROI 1:1");
+                                ui.add(egui::DragValue::new(&mut self.chantier_roi_size).range(128..=2048).speed(64));
+                            });
+                            if ui
+                                .add_enabled(!self.is_running(), egui::Button::new("Load & Run Chantier Pair (1:1 GeoTIFF)"))
+                                .clicked()
+                            {
+                                self.load_chantier_pair(ctx);
+                            }
+                        });
 
                     egui::CollapsingHeader::new("Synthetic Terrain & Input Files")
                         .default_open(true)
