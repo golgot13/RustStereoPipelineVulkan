@@ -572,12 +572,253 @@ pub fn build_log_2d_shader() -> Vec<u32> {
     b.finish()
 }
 
+/// 6. 3D Stereo Cost Volume Compute Shader (`C[y][x][d]` for SGM & MGM on GPU).
+/// Evaluates normalized SAD (`mode=0`), normalized SSD (`mode=1`), or true Zero-Mean NCC (`mode=2`)
+/// across `num_d` horizontal disparities starting at `min_dx`, setting out-of-bounds `x + d` to `2.0`.
+/// Bindings:
+///   0: `left[]` (f32)
+///   1: `right[]` (f32)
+///   2: `out_cost_vol[]` (f32, length `w * h * num_d`, layout `((y * w) + x) * num_d + di`)
+///   3: `params[]` (i32): `[width, height, half_kw, half_kh, min_dx, num_d, cost_mode]`
+pub fn build_cost_volume_3d_shader() -> Vec<u32> {
+    let mut b = SpirvBuilder::new(16, 16, 1);
+    let buf_l = b.add_storage_buffer_f32(0);
+    let buf_r = b.add_storage_buffer_f32(1);
+    let buf_vol = b.add_storage_buffer_f32(2);
+    let buf_p = b.add_storage_buffer_i32(3);
+
+    let c0 = b.const_i32(0);
+    let c1 = b.const_i32(1);
+    let c2 = b.const_i32(2);
+    let c3 = b.const_i32(3);
+    let c4 = b.const_i32(4);
+    let c5 = b.const_i32(5);
+    let c6 = b.const_i32(6);
+    let f0 = b.const_f32(0.0);
+    let f1 = b.const_f32(1.0);
+    let f2 = b.const_f32(2.0);
+    let f_eps = b.const_f32(1.0e-6);
+
+    b.begin_main();
+    let var_di = b.fn_var_i32();
+    let var_ky = b.fn_var_i32();
+    let var_kx = b.fn_var_i32();
+    let var_acc = b.fn_var_f32();
+    let var_sl = b.fn_var_f32();
+    let var_sr = b.fn_var_f32();
+    let var_slr = b.fn_var_f32();
+    let var_sll = b.fn_var_f32();
+    let var_srr = b.fn_var_f32();
+
+    let (gx, gy) = b.load_global_xy();
+    let w = b.load_buf_i32(buf_p, c0, c0);
+    let h = b.load_buf_i32(buf_p, c0, c1);
+    let hkw = b.load_buf_i32(buf_p, c0, c2);
+    let hkh = b.load_buf_i32(buf_p, c0, c3);
+    let min_dx = b.load_buf_i32(buf_p, c0, c4);
+    let num_d = b.load_buf_i32(buf_p, c0, c5);
+    let cost_mode = b.load_buf_i32(buf_p, c0, c6);
+
+    let oob_x = b.binop(OP_SGREATER_THAN_EQUAL, b.ty_bool, gx, w);
+    let oob_y = b.binop(OP_SGREATER_THAN_EQUAL, b.ty_bool, gy, h);
+    let oob = b.binop(OP_LOGICAL_OR, b.ty_bool, oob_x, oob_y);
+    let lbl_ret = b.id();
+    let lbl_body = b.id();
+    b.selection_merge(lbl_body);
+    b.branch_cond(oob, lbl_ret, lbl_body);
+    b.label(lbl_ret);
+    b.return_void();
+
+    b.label(lbl_body);
+    let wm1 = b.binop(OP_ISUB, b.ty_i32, w, c1);
+    let hm1 = b.binop(OP_ISUB, b.ty_i32, h, c1);
+    let neg_hkw = b.binop(OP_ISUB, b.ty_i32, c0, hkw);
+    let neg_hkh = b.binop(OP_ISUB, b.ty_i32, c0, hkh);
+    let hkw_p1 = b.binop(OP_IADD, b.ty_i32, hkw, c1);
+    let hkh_p1 = b.binop(OP_IADD, b.ty_i32, hkh, c1);
+
+    let hkw2 = b.binop(OP_IMUL, b.ty_i32, hkw, c2);
+    let kw_full = b.binop(OP_IADD, b.ty_i32, hkw2, c1);
+    let hkh2 = b.binop(OP_IMUL, b.ty_i32, hkh, c2);
+    let kh_full = b.binop(OP_IADD, b.ty_i32, hkh2, c1);
+    let cnt_i = b.binop(OP_IMUL, b.ty_i32, kw_full, kh_full);
+    let cnt_f = b.unop(OP_CONVERT_S_TO_F, b.ty_f32, cnt_i);
+
+    let gy_w = b.binop(OP_IMUL, b.ty_i32, gy, w);
+    let pix_idx = b.binop(OP_IADD, b.ty_i32, gy_w, gx);
+    let vol_base = b.binop(OP_IMUL, b.ty_i32, pix_idx, num_d);
+
+    b.store(var_di, c0);
+    let lbl_d_hdr = b.id();
+    let lbl_d_body = b.id();
+    let lbl_d_cont = b.id();
+    let lbl_d_end = b.id();
+    b.branch(lbl_d_hdr);
+    b.label(lbl_d_hdr);
+    b.loop_merge(lbl_d_end, lbl_d_cont);
+    let di = b.load(b.ty_i32, var_di);
+    let d_cond = b.binop(OP_SLESS_THAN, b.ty_bool, di, num_d);
+    b.branch_cond(d_cond, lbl_d_body, lbl_d_end);
+
+    b.label(lbl_d_body);
+    let d = b.binop(OP_IADD, b.ty_i32, min_dx, di);
+    let rx_center = b.binop(OP_IADD, b.ty_i32, gx, d);
+    let oob_l = b.binop(OP_SLESS_THAN, b.ty_bool, rx_center, c0);
+    let oob_r = b.binop(OP_SGREATER_THAN_EQUAL, b.ty_bool, rx_center, w);
+    let oob_d = b.binop(OP_LOGICAL_OR, b.ty_bool, oob_l, oob_r);
+    let vol_idx = b.binop(OP_IADD, b.ty_i32, vol_base, di);
+
+    let lbl_oob = b.id();
+    let lbl_in = b.id();
+    let lbl_merge = b.id();
+    b.selection_merge(lbl_merge);
+    b.branch_cond(oob_d, lbl_oob, lbl_in);
+
+    b.label(lbl_oob);
+    b.store_buf_f32(buf_vol, c0, vol_idx, f2);
+    b.branch(lbl_merge);
+
+    b.label(lbl_in);
+    b.store(var_acc, f0);
+    b.store(var_sl, f0);
+    b.store(var_sr, f0);
+    b.store(var_slr, f0);
+    b.store(var_sll, f0);
+    b.store(var_srr, f0);
+    b.store(var_ky, neg_hkh);
+
+    let lbl_ky_hdr = b.id();
+    let lbl_ky_body = b.id();
+    let lbl_ky_cont = b.id();
+    let lbl_ky_end = b.id();
+    b.branch(lbl_ky_hdr);
+    b.label(lbl_ky_hdr);
+    b.loop_merge(lbl_ky_end, lbl_ky_cont);
+    let ky = b.load(b.ty_i32, var_ky);
+    let ky_cond = b.binop(OP_SLESS_THAN, b.ty_bool, ky, hkh_p1);
+    b.branch_cond(ky_cond, lbl_ky_body, lbl_ky_end);
+
+    b.label(lbl_ky_body);
+    let sy_raw = b.binop(OP_IADD, b.ty_i32, gy, ky);
+    let sy = b.glsl3(GLSL_SCLAMP, b.ty_i32, sy_raw, c0, hm1);
+    let row_off = b.binop(OP_IMUL, b.ty_i32, sy, w);
+    b.store(var_kx, neg_hkw);
+
+    let lbl_kx_hdr = b.id();
+    let lbl_kx_body = b.id();
+    let lbl_kx_cont = b.id();
+    let lbl_kx_end = b.id();
+    b.branch(lbl_kx_hdr);
+    b.label(lbl_kx_hdr);
+    b.loop_merge(lbl_kx_end, lbl_kx_cont);
+    let kx = b.load(b.ty_i32, var_kx);
+    let kx_cond = b.binop(OP_SLESS_THAN, b.ty_bool, kx, hkw_p1);
+    b.branch_cond(kx_cond, lbl_kx_body, lbl_kx_end);
+
+    b.label(lbl_kx_body);
+    let lx_raw = b.binop(OP_IADD, b.ty_i32, gx, kx);
+    let lx = b.glsl3(GLSL_SCLAMP, b.ty_i32, lx_raw, c0, wm1);
+    let rx_raw = b.binop(OP_IADD, b.ty_i32, lx_raw, d);
+    let rx = b.glsl3(GLSL_SCLAMP, b.ty_i32, rx_raw, c0, wm1);
+    let l_idx = b.binop(OP_IADD, b.ty_i32, row_off, lx);
+    let r_idx = b.binop(OP_IADD, b.ty_i32, row_off, rx);
+    let lv = b.load_buf_f32(buf_l, c0, l_idx);
+    let rv = b.load_buf_f32(buf_r, c0, r_idx);
+
+    let diff = b.binop(OP_FSUB, b.ty_f32, lv, rv);
+    let abs_diff = b.glsl1(GLSL_FABS, b.ty_f32, diff);
+    let sq_diff = b.binop(OP_FMUL, b.ty_f32, diff, diff);
+    let is_ssd = b.binop(OP_IEQUAL, b.ty_bool, cost_mode, c1);
+    let term = b.select(b.ty_f32, is_ssd, sq_diff, abs_diff);
+    let cur_acc = b.load(b.ty_f32, var_acc);
+    let next_acc = b.binop(OP_FADD, b.ty_f32, cur_acc, term);
+    b.store(var_acc, next_acc);
+
+    // Accumulate zero-mean NCC moments
+    let c_sl = b.load(b.ty_f32, var_sl);
+    let c_sr = b.load(b.ty_f32, var_sr);
+    let c_slr = b.load(b.ty_f32, var_slr);
+    let c_sll = b.load(b.ty_f32, var_sll);
+    let c_srr = b.load(b.ty_f32, var_srr);
+    let p_lr = b.binop(OP_FMUL, b.ty_f32, lv, rv);
+    let p_ll = b.binop(OP_FMUL, b.ty_f32, lv, lv);
+    let p_rr = b.binop(OP_FMUL, b.ty_f32, rv, rv);
+    let n_sl = b.binop(OP_FADD, b.ty_f32, c_sl, lv);
+    let n_sr = b.binop(OP_FADD, b.ty_f32, c_sr, rv);
+    let n_slr = b.binop(OP_FADD, b.ty_f32, c_slr, p_lr);
+    let n_sll = b.binop(OP_FADD, b.ty_f32, c_sll, p_ll);
+    let n_srr = b.binop(OP_FADD, b.ty_f32, c_srr, p_rr);
+    b.store(var_sl, n_sl);
+    b.store(var_sr, n_sr);
+    b.store(var_slr, n_slr);
+    b.store(var_sll, n_sll);
+    b.store(var_srr, n_srr);
+    b.branch(lbl_kx_cont);
+
+    b.label(lbl_kx_cont);
+    let nkx = b.binop(OP_IADD, b.ty_i32, kx, c1);
+    b.store(var_kx, nkx);
+    b.branch(lbl_kx_hdr);
+
+    b.label(lbl_kx_end);
+    b.branch(lbl_ky_cont);
+
+    b.label(lbl_ky_cont);
+    let nky = b.binop(OP_IADD, b.ty_i32, ky, c1);
+    b.store(var_ky, nky);
+    b.branch(lbl_ky_hdr);
+
+    b.label(lbl_ky_end);
+    let acc_val = b.load(b.ty_f32, var_acc);
+    let sad_ssd_norm = b.binop(OP_FDIV, b.ty_f32, acc_val, cnt_f);
+    let sl = b.load(b.ty_f32, var_sl);
+    let sr = b.load(b.ty_f32, var_sr);
+    let slr = b.load(b.ty_f32, var_slr);
+    let sll = b.load(b.ty_f32, var_sll);
+    let srr = b.load(b.ty_f32, var_srr);
+
+    let ml = b.binop(OP_FDIV, b.ty_f32, sl, cnt_f);
+    let mr = b.binop(OP_FDIV, b.ty_f32, sr, cnt_f);
+    let sl_mr = b.binop(OP_FMUL, b.ty_f32, sl, mr);
+    let cov = b.binop(OP_FSUB, b.ty_f32, slr, sl_mr);
+    let sl_ml = b.binop(OP_FMUL, b.ty_f32, sl, ml);
+    let vl_raw = b.binop(OP_FSUB, b.ty_f32, sll, sl_ml);
+    let sr_mr = b.binop(OP_FMUL, b.ty_f32, sr, mr);
+    let vr_raw = b.binop(OP_FSUB, b.ty_f32, srr, sr_mr);
+    let vl = b.glsl2(GLSL_FMAX, b.ty_f32, vl_raw, f0);
+    let vr = b.glsl2(GLSL_FMAX, b.ty_f32, vr_raw, f0);
+    let vl_vr = b.binop(OP_FMUL, b.ty_f32, vl, vr);
+    let denom_sq = b.binop(OP_FADD, b.ty_f32, vl_vr, f_eps);
+    let denom = b.glsl1(GLSL_SQRT, b.ty_f32, denom_sq);
+    let ncc = b.binop(OP_FDIV, b.ty_f32, cov, denom);
+    let ncc_cost_raw = b.binop(OP_FSUB, b.ty_f32, f1, ncc);
+    let ncc_clamped_lo = b.glsl2(GLSL_FMAX, b.ty_f32, ncc_cost_raw, f0);
+    let ncc_cost = b.glsl2(GLSL_FMIN, b.ty_f32, ncc_clamped_lo, f2);
+    let is_ncc = b.binop(OP_IEQUAL, b.ty_bool, cost_mode, c2);
+    let final_cost = b.select(b.ty_f32, is_ncc, ncc_cost, sad_ssd_norm);
+    b.store_buf_f32(buf_vol, c0, vol_idx, final_cost);
+    b.branch(lbl_merge);
+
+    b.label(lbl_merge);
+    b.branch(lbl_d_cont);
+
+    b.label(lbl_d_cont);
+    let ndi = b.binop(OP_IADD, b.ty_i32, di, c1);
+    b.store(var_di, ndi);
+    b.branch(lbl_d_hdr);
+
+    b.label(lbl_d_end);
+    b.end_main();
+    b.finish()
+}
+
 /// Summary info for all built-in SPIR-V shaders.
 pub fn shader_catalog() -> Vec<(&'static str, Vec<u32>)> {
     vec![
         ("prefilter_box_submean", build_prefilter_shader()),
         ("prefilter_log_2d", build_log_2d_shader()),
         ("stereo_bm_sad_ssd_ncc", build_stereo_bm_shader()),
+        ("stereo_cost_vol_3d", build_cost_volume_3d_shader()),
         ("subpixel_parabola", build_subpixel_parabola_shader()),
         ("dem_hillshade", build_hillshade_shader()),
     ]

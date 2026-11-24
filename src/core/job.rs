@@ -102,6 +102,8 @@ pub struct JobSpec {
     pub profile: Option<ProfileTier>,
     pub write_outputs: bool,
     pub write_checkpoints: bool,
+    pub write_ply: bool,
+    pub write_intermediates: bool,
     pub settings: StereoSettings,
 }
 
@@ -125,6 +127,8 @@ impl Default for JobSpec {
             profile: None,
             write_outputs: true,
             write_checkpoints: true,
+            write_ply: true,
+            write_intermediates: true,
             settings,
         }
     }
@@ -222,6 +226,14 @@ impl JobSpec {
         if self.resume {
             parts.push("--resume".into());
         }
+        if !self.write_checkpoints {
+            parts.push("--no-checkpoints".into());
+        }
+        if !self.write_ply && !self.write_intermediates {
+            parts.push("--fast-io".into());
+        } else if !self.write_ply {
+            parts.push("--no-ply".into());
+        }
         if let Some(p) = self.profile {
             parts.push(format!("--profile {}", p.name()));
         }
@@ -239,6 +251,8 @@ impl JobSpec {
         root.insert("tile_size".into(), JsonValue::Number(self.tile_size as f64));
         root.insert("write_outputs".into(), JsonValue::Bool(self.write_outputs));
         root.insert("write_checkpoints".into(), JsonValue::Bool(self.write_checkpoints));
+        root.insert("write_ply".into(), JsonValue::Bool(self.write_ply));
+        root.insert("write_intermediates".into(), JsonValue::Bool(self.write_intermediates));
         if let Some(p) = self.profile {
             root.insert("profile".into(), JsonValue::String(p.name().into()));
         }
@@ -346,6 +360,12 @@ impl JobSpec {
         }
         if let Some(wc) = v.get("write_checkpoints").and_then(|x| x.as_bool()) {
             spec.write_checkpoints = wc;
+        }
+        if let Some(wp) = v.get("write_ply").and_then(|x| x.as_bool()) {
+            spec.write_ply = wp;
+        }
+        if let Some(wi) = v.get("write_intermediates").and_then(|x| x.as_bool()) {
+            spec.write_intermediates = wi;
         }
         if let Some(pr) = v.get("profile").and_then(|x| x.as_str()) {
             spec.profile = ProfileTier::from_str(pr);

@@ -176,18 +176,32 @@ impl StereoPipelineEngine {
 
     /// Save standard ASP output products (`<prefix>-L.tif`, `-R.tif`, `-D.tif`, `-F.tif`, `-PC.ply`, `-DEM.tif`, `-hillshade.tif`).
     pub fn save_outputs(prefix: &Path, res: &PipelineResult) -> io::Result<()> {
+        Self::save_outputs_opts(prefix, res, true, true)
+    }
+
+    /// Save output products with fine-grained control over PLY and intermediate raster writing (`--fast-io`).
+    pub fn save_outputs_opts(
+        prefix: &Path,
+        res: &PipelineResult,
+        write_ply: bool,
+        write_intermediates: bool,
+    ) -> io::Result<()> {
         if let Some(parent) = prefix.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
         let p = prefix.to_string_lossy();
-        save_image(Path::new(&format!("{}-L.tif", p)), &res.left_pprc)?;
-        save_image(Path::new(&format!("{}-R.tif", p)), &res.right_pprc)?;
-        save_disparity_tiff(Path::new(&format!("{}-D.tif", p)), &res.disp_raw)?;
-        save_disparity_tiff(Path::new(&format!("{}-RD.tif", p)), &res.disp_refined)?;
-        save_disparity_tiff(Path::new(&format!("{}-F.tif", p)), &res.disp_filtered)?;
-        save_point_cloud_ply(Path::new(&format!("{}-PC.ply", p)), &res.point_cloud)?;
+        if write_intermediates {
+            save_image(Path::new(&format!("{}-L.tif", p)), &res.left_pprc)?;
+            save_image(Path::new(&format!("{}-R.tif", p)), &res.right_pprc)?;
+            save_disparity_tiff(Path::new(&format!("{}-D.tif", p)), &res.disp_raw)?;
+            save_disparity_tiff(Path::new(&format!("{}-RD.tif", p)), &res.disp_refined)?;
+            save_disparity_tiff(Path::new(&format!("{}-F.tif", p)), &res.disp_filtered)?;
+        }
+        if write_ply {
+            save_point_cloud_ply(Path::new(&format!("{}-PC.ply", p)), &res.point_cloud)?;
+        }
         save_tiff_f32(
             Path::new(&format!("{}-DEM.tif", p)),
             &res.dem.elevation,

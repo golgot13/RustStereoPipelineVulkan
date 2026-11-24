@@ -14,6 +14,8 @@ pub fn run_fltr(disp_in: &DisparityMap, s: &StereoSettings) -> DisparityMap {
         for _ in 0..s.rm_cleanup_passes.max(1) {
             cur = outlier_erode(&cur, s);
         }
+        let max_speckle = ((cur.width as usize * cur.height as usize) / 4096).clamp(16, 128);
+        remove_small_speckles(&mut cur, max_speckle, s.rm_threshold.min(2.0).max(1.0));
     }
 
     if s.median_filter_size >= 3 {
@@ -168,4 +170,53 @@ fn fill_small_holes(disp: &DisparityMap, radius: i32) -> DisparityMap {
         }
     }
     out
+}
+
+/// ASP `erode-max-size` / OpenCV `filterSpeckles`: remove small isolated disparity islands
+/// (e.g. false matches floating above/below real roofs and ground in 3D point clouds).
+fn remove_small_speckles(disp: &mut DisparityMap, max_speckle_size: usize, max_diff: f32) {
+    let w = disp.width as usize;
+    let h = disp.height as usize;
+    let n = w * h;
+    if n == 0 || max_speckle_size == 0 {
+        return;
+    }
+    let mut visited = vec![0u8; n];
+    let mut stack: Vec<usize> = Vec::with_capacity(256);
+    let mut component: Vec<usize> = Vec::with_capacity(256);
+
+    for start in 0..n {
+        if disp.valid[start] == 0 || visited[start] != 0 {
+            continue;
+        }
+        visited[start] = 1;
+        stack.clear();
+        component.clear();
+        stack.push(start);
+
+        while let Some(idx) = stack.pop() {
+            component.push(idx);
+            let x = idx % w;
+            let y = idx / w;
+            let d = disp.dx[idx];
+
+            let mut try_push = |nx: usize, ny: usize| {
+                let nidx = ny * w + nx;
+                if visited[nidx] == 0 && disp.valid[nidx] != 0 && (disp.dx[nidx] - d).abs() <= max_diff {
+                    visited[nidx] = 1;
+                    stack.push(nidx);
+                }
+            };
+            if x > 0 { try_push(x - 1, y); }
+            if x + 1 < w { try_push(x + 1, y); }
+            if y > 0 { try_push(x, y - 1); }
+            if y + 1 < h { try_push(x, y + 1); }
+        }
+
+        if component.len() <= max_speckle_size {
+            for &idx in &component {
+                disp.valid[idx] = 0;
+            }
+        }
+    }
 }

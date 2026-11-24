@@ -28,6 +28,7 @@ pub enum ShaderKind {
     PrefilterBoxSubmean,
     PrefilterLog2d,
     StereoBm,
+    StereoCostVolume3d,
     SubpixelParabola,
     DemHillshade,
 }
@@ -36,7 +37,7 @@ impl ShaderKind {
     fn binding_count(self) -> usize {
         match self {
             Self::PrefilterBoxSubmean | Self::PrefilterLog2d => 3,
-            Self::DemHillshade => 4,
+            Self::DemHillshade | Self::StereoCostVolume3d => 4,
             Self::StereoBm => 5,
             Self::SubpixelParabola => 6,
         }
@@ -47,6 +48,7 @@ impl ShaderKind {
             Self::PrefilterBoxSubmean => shaders::build_prefilter_shader(),
             Self::PrefilterLog2d => shaders::build_log_2d_shader(),
             Self::StereoBm => shaders::build_stereo_bm_shader(),
+            Self::StereoCostVolume3d => shaders::build_cost_volume_3d_shader(),
             Self::SubpixelParabola => shaders::build_subpixel_parabola_shader(),
             Self::DemHillshade => shaders::build_hillshade_shader(),
         }
@@ -689,6 +691,54 @@ impl VulkanCompute {
             1,
         )?;
         Ok((bytes_to_f32(&res[0]), bytes_to_f32(&res[1])))
+    }
+
+    /// Run GPU 3D Stereo Cost Volume computation (`C[y][x][d]` for SGM & MGM) via cached SPIR-V pipeline.
+    /// Computes normalized SAD (0), SSD (1), or Zero-Mean NCC (2) for `num_d` horizontal disparities.
+    pub fn run_stereo_cost_volume(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        width: u32,
+        height: u32,
+        half_kw: i32,
+        half_kh: i32,
+        min_dx: i32,
+        num_d: usize,
+        cost_mode: i32,
+    ) -> Result<Vec<f32>, String> {
+        let vol_elems = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(num_d))
+            .ok_or_else(|| "Cost volume size overflow".to_string())?;
+        // Guard VRAM/staging allocation to 512 MB max per dispatch
+        if vol_elems * 4 > 512 * 1024 * 1024 {
+            return Err("Cost volume exceeds 512 MB single-dispatch guard".to_string());
+        }
+        let params: [i32; 7] = [
+            width as i32,
+            height as i32,
+            half_kw,
+            half_kh,
+            min_dx,
+            num_d as i32,
+            cost_mode,
+        ];
+        let vol_zeros = vec![0.0f32; vol_elems];
+        let res = self.dispatch_cached(
+            ShaderKind::StereoCostVolume3d,
+            &[
+                as_bytes(left),
+                as_bytes(right),
+                as_bytes(&vol_zeros),
+                as_bytes(&params),
+            ],
+            &[2],
+            (width + 15) / 16,
+            (height + 15) / 16,
+            1,
+        )?;
+        Ok(bytes_to_f32(&res[0]))
     }
 
     /// Run GPU Subpixel Parabola refinement via cached SPIR-V compute pipeline.

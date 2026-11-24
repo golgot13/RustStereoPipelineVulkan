@@ -57,12 +57,11 @@ pub fn run_corr(
     }
 
     // Build cost volume & solve using selected algorithm (BM / SGM / MGM)
-    let disp = match settings.stereo_algorithm {
-        StereoAlgorithm::AspBm => correlate_bm_cpu(left, right, settings),
-        StereoAlgorithm::AspSgm => correlate_sgm_cpu(left, right, settings, false),
-        StereoAlgorithm::AspMgm => correlate_sgm_cpu(left, right, settings, true),
-    };
-    (disp, false)
+    match settings.stereo_algorithm {
+        StereoAlgorithm::AspBm => (correlate_bm_cpu(left, right, settings), false),
+        StereoAlgorithm::AspSgm => correlate_sgm(left, right, settings, false, vk),
+        StereoAlgorithm::AspMgm => correlate_sgm(left, right, settings, true, vk),
+    }
 }
 
 /// Precompute 5x5 Census bitstrings (25 bits packed into u32) for fast Hamming matching.
@@ -354,14 +353,16 @@ fn census_patch_cost(
     sum as f32 / cnt.max(1) as f32
 }
 
-/// Semi-Global Matching (ASP SGM) & More Global Matching (ASP MGM) with 4-direction
+/// Semi-Global Matching (ASP SGM) & More Global Matching (ASP MGM) with GPU Vulkan Compute
+/// 3D cost volume acceleration (with automatic AVX2 multi-thread CPU fallback) + 4-direction
 /// dynamic programming (or 2D quadrant aggregation for MGM) + LR consistency check.
-fn correlate_sgm_cpu(
+fn correlate_sgm(
     left: &ImageF32,
     right: &ImageF32,
     s: &StereoSettings,
     use_mgm: bool,
-) -> DisparityMap {
+    vk: Option<&VulkanCompute>,
+) -> (DisparityMap, bool) {
     let w = left.width as usize;
     let h = left.height as usize;
     let min_d = s.search_min_x;
@@ -372,45 +373,33 @@ fn correlate_sgm_cpu(
     let n_threads = s.threads.clamp(1, h.max(1));
     let rows_per = (h + n_threads - 1) / n_threads;
 
-    let census_l = compute_census_5x5(left);
-    let census_r = compute_census_5x5(right);
-
-    // 1. Build 3D matching cost volume C[y][x][d] in parallel
-    let mut cost_vol = vec![1.0f32; w * h * num_d];
-    std::thread::scope(|scope| {
-        for (t, chunk) in cost_vol.chunks_mut(rows_per * w * num_d).enumerate() {
-            let y_start = t * rows_per;
-            let cl = &census_l;
-            let cr = &census_r;
-            scope.spawn(move || {
-                let rows = chunk.len() / (w * num_d);
-                for ly in 0..rows {
-                    let y = (y_start + ly) as i32;
-                    for x in 0..w as i32 {
-                        let base = (ly * w + x as usize) * num_d;
-                        for di in 0..num_d {
-                            let d = min_d + di as i32;
-                            if x + d < 0 || x + d >= w as i32 {
-                                chunk[base + di] = 2.0;
-                                continue;
-                            }
-                            let c = match s.cost_mode {
-                                CostMode::Census => {
-                                    census_patch_cost(cl, cr, w as i32, h as i32, x, y, d, 0, hkw.min(2), hkh.min(2))
-                                }
-                                _ => {
-                                    let pc = patch_cost(left, right, x, y, d, 0, hkw, hkh, s.cost_mode);
-                                    let cc = census_patch_cost(cl, cr, w as i32, h as i32, x, y, d, 0, 1, 1);
-                                    0.7 * pc + 0.3 * cc
-                                }
-                            };
-                            chunk[base + di] = c;
-                        }
-                    }
+    // 1. Build 3D matching cost volume C[y][x][d] on Vulkan GPU when available, else AVX2 CPU
+    let mut used_vk = false;
+    let cost_vol: Vec<f32> = if s.cost_mode != CostMode::Census {
+        if let Some(gpu) = vk {
+            match gpu.run_stereo_cost_volume(
+                &left.data,
+                &right.data,
+                left.width,
+                left.height,
+                hkw,
+                hkh,
+                min_d,
+                num_d,
+                s.cost_mode as i32,
+            ) {
+                Ok(vol) if vol.len() == w * h * num_d => {
+                    used_vk = true;
+                    vol
                 }
-            });
+                _ => build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per),
+            }
+        } else {
+            build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per)
         }
-    });
+    } else {
+        build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per)
+    };
 
     // 2. Multi-path SGM / MGM cost aggregation
     let p1 = s.sgm_p1;
@@ -531,7 +520,60 @@ fn correlate_sgm_cpu(
 
     let mut disp = DisparityMap::new(left.width, left.height);
     apply_lr_check(left.width, left.height, &dx_lr, &dx_rl, s.lr_threshold, &mut disp);
-    disp
+    (disp, used_vk)
+}
+
+fn build_cost_volume_cpu(
+    left: &ImageF32,
+    right: &ImageF32,
+    s: &StereoSettings,
+    min_d: i32,
+    num_d: usize,
+    hkw: i32,
+    hkh: i32,
+    rows_per: usize,
+) -> Vec<f32> {
+    let w = left.width as usize;
+    let h = left.height as usize;
+    let census_l = compute_census_5x5(left);
+    let census_r = compute_census_5x5(right);
+
+    let mut cost_vol = vec![1.0f32; w * h * num_d];
+    std::thread::scope(|scope| {
+        for (t, chunk) in cost_vol.chunks_mut(rows_per * w * num_d).enumerate() {
+            let y_start = t * rows_per;
+            let cl = &census_l;
+            let cr = &census_r;
+            scope.spawn(move || {
+                let rows = chunk.len() / (w * num_d);
+                for ly in 0..rows {
+                    let y = (y_start + ly) as i32;
+                    for x in 0..w as i32 {
+                        let base = (ly * w + x as usize) * num_d;
+                        for di in 0..num_d {
+                            let d = min_d + di as i32;
+                            if x + d < 0 || x + d >= w as i32 {
+                                chunk[base + di] = 2.0;
+                                continue;
+                            }
+                            let c = match s.cost_mode {
+                                CostMode::Census => {
+                                    census_patch_cost(cl, cr, w as i32, h as i32, x, y, d, 0, hkw.min(2), hkh.min(2))
+                                }
+                                _ => {
+                                    let pc = patch_cost(left, right, x, y, d, 0, hkw, hkh, s.cost_mode);
+                                    let cc = census_patch_cost(cl, cr, w as i32, h as i32, x, y, d, 0, 1, 1);
+                                    0.7 * pc + 0.3 * cc
+                                }
+                            };
+                            chunk[base + di] = c;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    cost_vol
 }
 
 fn apply_lr_check(

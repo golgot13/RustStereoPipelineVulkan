@@ -541,8 +541,13 @@ impl WorkflowExecutor {
 
         if spec.write_outputs {
             let out_p = Path::new(&spec.output_prefix);
-            StereoPipelineEngine::save_outputs(out_p, &result)
-                .map_err(|e| PipelineError::Io(format!("Failed saving outputs: {}", e)))?;
+            StereoPipelineEngine::save_outputs_opts(
+                out_p,
+                &result,
+                spec.write_ply,
+                spec.write_intermediates,
+            )
+            .map_err(|e| PipelineError::Io(format!("Failed saving outputs: {}", e)))?;
             report.save(out_p)?;
         }
 

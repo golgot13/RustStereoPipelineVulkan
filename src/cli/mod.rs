@@ -116,6 +116,10 @@ SCRIPTING & ROBUSTNESS OPTIONS:
   --tile-size <N>                Full-Scale 1:1 sliding-window tile size (default: auto)
   --profile <tier>               Hardware RAM tier: compact | standard | workstation
   --crs <code|name>              Output CRS: LOCAL | EPSG:4326 | EPSG:2154 | EPSG:3942..3950 (CC42..CC50) | EPSG:32631 | IAU:MOON | IAU:MARS
+  --center-gcp                   In chantier mode, center 1:1 ROI on closest overlapping GCP
+  --no-checkpoints               Disable 00_checkpoints/ TIFF writes for faster disk I/O
+  --no-ply                       Skip writing -PC.ply point cloud
+  --fast-io                      Fast batch I/O: disables checkpoints, PLY, and intermediate TIFFs (keeps DEM/hillshade/PNG/reports)
   --continue-on-error            In batch mode, continue running remaining jobs on failure
 
 STEREO OPTIONS:
@@ -165,6 +169,9 @@ struct ParsedArgs {
     roi_size: u32,
     center_gcp: bool,
     custom_search: bool,
+    no_checkpoints: bool,
+    no_ply: bool,
+    fast_io: bool,
 }
 
 fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
@@ -198,6 +205,9 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
     let mut roi_size = 1024u32;
     let mut center_gcp = false;
     let mut custom_search = false;
+    let mut no_checkpoints = false;
+    let mut no_ply = false;
+    let mut fast_io = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -300,6 +310,13 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
             }
             "--all-pairs" => all_pairs = true,
             "--center-gcp" => center_gcp = true,
+            "--no-checkpoints" => no_checkpoints = true,
+            "--no-ply" => no_ply = true,
+            "--fast-io" => {
+                fast_io = true;
+                no_checkpoints = true;
+                no_ply = true;
+            }
             "--roi-size" => {
                 roi_size = next(&mut i, a)?.parse::<u32>().map_err(|_| PipelineError::Cli("Invalid --roi-size".into()))?.clamp(128, 4096);
             }
@@ -343,6 +360,9 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
         roi_size,
         center_gcp,
         custom_search,
+        no_checkpoints,
+        no_ply,
+        fast_io,
     })
 }
 
@@ -360,6 +380,9 @@ fn build_spec(p: &ParsedArgs, input: JobInput, out_prefix: String) -> JobSpec {
     spec.resume = p.resume;
     spec.tile_size = p.tile_size.unwrap_or(hw.tile_size);
     spec.profile = p.profile;
+    spec.write_checkpoints = !p.no_checkpoints;
+    spec.write_ply = !p.no_ply;
+    spec.write_intermediates = !p.fast_io;
     spec.settings = p.settings.clone();
     spec
 }
@@ -540,8 +563,10 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         // Export rectified 1:1 ROI GeoTIFFs & exact ASP .tsai cameras for 100% CLI reproducibility
         let rect_l_path = format!("{}-rect-L.tif", out_prefix);
         let rect_r_path = format!("{}-rect-R.tif", out_prefix);
-        save_tiff_f32(Path::new(&rect_l_path), &roi.left_img, None)?;
-        save_tiff_f32(Path::new(&rect_r_path), &roi.right_img, None)?;
+        if !p.fast_io {
+            save_tiff_f32(Path::new(&rect_l_path), &roi.left_img, None)?;
+            save_tiff_f32(Path::new(&rect_r_path), &roi.right_img, None)?;
+        }
         if let AnyCamera::Pinhole(ref cl) = roi.left_cam {
             cl.save_tsai(Path::new(&format!("{}-cam-L.tsai", out_prefix)))?;
         }
@@ -599,9 +624,15 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
             println!("\n{}", out.report.to_text());
             if gcp_val.matched_gcps > 0 {
                 println!(
-                    "  Validation GCP ({} points dans le DEM) : biais dZ={:+.3} m | RMSE dZ={:.3} m | max={:.3} m",
+                    "  Validation GCP ({} points, bilinéaire) : biais dZ={:+.3} m | RMSE dZ={:.3} m | max={:.3} m",
                     gcp_val.matched_gcps, gcp_val.dz_bias_m, gcp_val.dz_rmse_m, gcp_val.dz_max_abs_m
                 );
+                for s in &gcp_val.samples {
+                    println!(
+                        "    - GCP {:<12} : Z_gcp={:.3} m | Z_dem={:.3} m | dZ={:+.3} m",
+                        s.id, s.z_gcp, s.z_dem, s.dz_m
+                    );
+                }
             }
         }
         pair_summaries.push((

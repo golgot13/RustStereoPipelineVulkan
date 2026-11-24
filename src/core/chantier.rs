@@ -891,6 +891,17 @@ pub fn prepare_stereo_pair_roi_opts(
     })
 }
 
+/// Per-GCP vertical validation detail (`dz_m = z_dem - z_gcp`).
+#[derive(Debug, Clone)]
+pub struct GcpSampleError {
+    pub id: String,
+    pub x: f64,
+    pub y: f64,
+    pub z_gcp: f64,
+    pub z_dem: f64,
+    pub dz_m: f64,
+}
+
 /// Vertical accuracy report comparing triangulated DEM against known GCPs inside the DEM extent.
 #[derive(Debug, Clone)]
 pub struct GcpValidationReport {
@@ -898,40 +909,95 @@ pub struct GcpValidationReport {
     pub dz_bias_m: f64,
     pub dz_rmse_m: f64,
     pub dz_max_abs_m: f64,
+    pub samples: Vec<GcpSampleError>,
 }
 
-pub fn validate_dem_against_gcps(dem: &DemGrid, gcps: &[GroundControlPoint]) -> GcpValidationReport {
-    let mut diffs = Vec::new();
-    for g in gcps {
-        if g.x >= dem.min_x && g.x <= dem.max_x && g.y >= dem.min_y && g.y <= dem.max_y {
-            let fx = ((g.x - dem.min_x) / dem.pixel_size) as f32;
-            let fy = ((dem.max_y - g.y) / dem.pixel_size) as f32;
-            let ix = fx.round() as u32;
-            let iy = fy.round() as u32;
-            if let Some(z_dem) = dem.elevation.get_checked(ix, iy) {
-                if z_dem.is_finite() {
-                    diffs.push(z_dem as f64 - g.z);
-                }
+/// Bilinearly sample a `DemGrid` at continuous raster coordinate `(fx, fy)`, falling back to nearest
+/// finite neighbor when adjacent cells contain nodata.
+fn sample_dem_bilinear(dem: &DemGrid, fx: f64, fy: f64) -> Option<f64> {
+    let w = dem.elevation.width;
+    let h = dem.elevation.height;
+    if w == 0 || h == 0 || !fx.is_finite() || !fy.is_finite() {
+        return None;
+    }
+    if fx < -0.5 || fy < -0.5 || fx > (w as f64 - 0.5) || fy > (h as f64 - 0.5) {
+        return None;
+    }
+    let fx_c = fx.clamp(0.0, (w - 1) as f64);
+    let fy_c = fy.clamp(0.0, (h - 1) as f64);
+    let x0 = fx_c.floor() as u32;
+    let y0 = fy_c.floor() as u32;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let tx = fx_c - x0 as f64;
+    let ty = fy_c - y0 as f64;
+
+    let corners = [
+        (dem.elevation.get_checked(x0, y0), (1.0 - tx) * (1.0 - ty)),
+        (dem.elevation.get_checked(x1, y0), tx * (1.0 - ty)),
+        (dem.elevation.get_checked(x0, y1), (1.0 - tx) * ty),
+        (dem.elevation.get_checked(x1, y1), tx * ty),
+    ];
+
+    let mut sum_w = 0.0f64;
+    let mut sum_z = 0.0f64;
+    for (val_opt, wt) in corners {
+        if let Some(v) = val_opt {
+            if v.is_finite() && wt > 0.0 {
+                sum_w += wt;
+                sum_z += (v as f64) * wt;
             }
         }
     }
-    if diffs.is_empty() {
+    if sum_w > 1e-6 {
+        Some(sum_z / sum_w)
+    } else {
+        let nx = fx_c.round() as u32;
+        let ny = fy_c.round() as u32;
+        dem.elevation
+            .get_checked(nx, ny)
+            .filter(|v| v.is_finite())
+            .map(|v| v as f64)
+    }
+}
+
+pub fn validate_dem_against_gcps(dem: &DemGrid, gcps: &[GroundControlPoint]) -> GcpValidationReport {
+    let mut samples = Vec::new();
+    for g in gcps {
+        if g.x >= dem.min_x && g.x <= dem.max_x && g.y >= dem.min_y && g.y <= dem.max_y {
+            let fx = (g.x - dem.min_x) / dem.pixel_size;
+            let fy = (dem.max_y - g.y) / dem.pixel_size;
+            if let Some(z_dem) = sample_dem_bilinear(dem, fx, fy) {
+                samples.push(GcpSampleError {
+                    id: g.id.clone(),
+                    x: g.x,
+                    y: g.y,
+                    z_gcp: g.z,
+                    z_dem,
+                    dz_m: z_dem - g.z,
+                });
+            }
+        }
+    }
+    if samples.is_empty() {
         return GcpValidationReport {
             matched_gcps: 0,
             dz_bias_m: 0.0,
             dz_rmse_m: 0.0,
             dz_max_abs_m: 0.0,
+            samples,
         };
     }
-    let n = diffs.len() as f64;
-    let bias = diffs.iter().sum::<f64>() / n;
-    let rmse = (diffs.iter().map(|d| d * d).sum::<f64>() / n).sqrt();
-    let max_abs = diffs.iter().map(|d| d.abs()).fold(0.0f64, f64::max);
+    let n = samples.len() as f64;
+    let bias = samples.iter().map(|s| s.dz_m).sum::<f64>() / n;
+    let rmse = (samples.iter().map(|s| s.dz_m * s.dz_m).sum::<f64>() / n).sqrt();
+    let max_abs = samples.iter().map(|s| s.dz_m.abs()).fold(0.0f64, f64::max);
     GcpValidationReport {
-        matched_gcps: diffs.len(),
+        matched_gcps: samples.len(),
         dz_bias_m: bias,
         dz_rmse_m: rmse,
         dz_max_abs_m: max_abs,
+        samples,
     }
 }
 
@@ -956,7 +1022,26 @@ pub fn chantier_summary_json(chantier: &Chantier, pair_reports: &[(String, f64, 
             m.insert("valid_pct".into(), JsonValue::Number(*valid_pct));
             m.insert("points_3d".into(), JsonValue::Number(*pts as f64));
             m.insert("gcp_matched".into(), JsonValue::Number(gcp.matched_gcps as f64));
+            m.insert("gcp_dz_bias_m".into(), JsonValue::Number(gcp.dz_bias_m));
             m.insert("gcp_dz_rmse_m".into(), JsonValue::Number(gcp.dz_rmse_m));
+            m.insert("gcp_dz_max_abs_m".into(), JsonValue::Number(gcp.dz_max_abs_m));
+            if !gcp.samples.is_empty() {
+                let g_arr: Vec<JsonValue> = gcp
+                    .samples
+                    .iter()
+                    .map(|s| {
+                        let mut gm = BTreeMap::new();
+                        gm.insert("id".into(), JsonValue::String(s.id.clone()));
+                        gm.insert("x".into(), JsonValue::Number(s.x));
+                        gm.insert("y".into(), JsonValue::Number(s.y));
+                        gm.insert("z_gcp".into(), JsonValue::Number(s.z_gcp));
+                        gm.insert("z_dem".into(), JsonValue::Number(s.z_dem));
+                        gm.insert("dz_m".into(), JsonValue::Number(s.dz_m));
+                        JsonValue::Object(gm)
+                    })
+                    .collect();
+                m.insert("gcp_samples".into(), JsonValue::Array(g_arr));
+            }
             JsonValue::Object(m)
         })
         .collect();
@@ -1100,5 +1185,38 @@ mod tests {
         }
         // Horizontal parallax must now carry the full height sensitivity (> 100 px for 40 m relief)
         assert!(max_dx > 100.0, "Expected strong horizontal parallax, got {}", max_dx);
+    }
+
+    #[test]
+    fn test_bilinear_gcp_validation_submillimeter() {
+        let mut elev = ImageF32::new(10, 10);
+        // Tilted plane: z(fx, fy) = 200.0 + 2.0 * fx + 4.0 * fy
+        for y in 0..10 {
+            for x in 0..10 {
+                elev.set(x, y, 200.0 + 2.0 * x as f32 + 4.0 * y as f32);
+            }
+        }
+        let dem = DemGrid {
+            elevation: elev.clone(),
+            hillshade: elev,
+            min_x: 1_901_000.0,
+            min_y: 3_143_000.0,
+            max_x: 1_901_009.0,
+            max_y: 3_143_009.0,
+            pixel_size: 1.0,
+        };
+        // GCP at fractional pixel fx = 3.25, fy = 5.5 -> exact z = 200 + 6.5 + 22.0 = 228.5 m
+        let gcp = GroundControlPoint {
+            id: "GCP_MEY_01".into(),
+            x: 1_901_003.25,
+            y: 3_143_003.50,
+            z: 228.25, // +0.25 m bias (DEM is 0.25 m above GCP)
+        };
+        let rep = validate_dem_against_gcps(&dem, &[gcp]);
+        assert_eq!(rep.matched_gcps, 1);
+        assert_eq!(rep.samples.len(), 1);
+        assert!((rep.samples[0].z_dem - 228.5).abs() < 1e-4);
+        assert!((rep.dz_bias_m - 0.25).abs() < 1e-4);
+        assert!((rep.dz_rmse_m - 0.25).abs() < 1e-4);
     }
 }
