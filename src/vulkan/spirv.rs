@@ -50,6 +50,7 @@ pub const OP_SLESS_THAN: u16 = 177;
 pub const OP_SGREATER_THAN_EQUAL: u16 = 175;
 pub const OP_FORD_LESS_THAN: u16 = 184;
 pub const OP_FORD_GREATER_THAN: u16 = 186;
+pub const OP_LOGICAL_NOT_EQUAL: u16 = 165;
 pub const OP_LOGICAL_OR: u16 = 166;
 pub const OP_LOGICAL_AND: u16 = 167;
 pub const OP_LOOP_MERGE: u16 = 246;

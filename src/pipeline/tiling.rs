@@ -108,6 +108,21 @@ pub fn run_tiled_stereo(
     tile_size: u32,
     vk: Option<&VulkanCompute>,
     cancel: &CancellationToken,
+    on_tile: impl FnMut(usize, usize),
+) -> Result<TiledDisparityResult> {
+    run_tiled_stereo_with_guide(left_pprc, right_pprc, None, settings, tile_size, vk, cancel, on_tile)
+}
+
+/// Same as `run_tiled_stereo`, forwarding the raw left radiometric image as the edge-aware SGM guide.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tiled_stereo_with_guide(
+    left_pprc: &ImageF32,
+    right_pprc: &ImageF32,
+    left_guide: Option<&ImageF32>,
+    settings: &StereoSettings,
+    tile_size: u32,
+    vk: Option<&VulkanCompute>,
+    cancel: &CancellationToken,
     mut on_tile: impl FnMut(usize, usize),
 ) -> Result<TiledDisparityResult> {
     let w = left_pprc.width;
@@ -128,7 +143,7 @@ pub fn run_tiled_stereo(
         on_tile(tile.index + 1, tile.total);
 
         if tile.total == 1 {
-            let (raw, used_vk) = corr::run_corr(left_pprc, right_pprc, settings, vk);
+            let (raw, used_vk) = corr::run_corr_with_guide(left_pprc, right_pprc, left_guide, settings, vk);
             if used_vk {
                 vk_dispatches += 2;
             }
@@ -147,8 +162,9 @@ pub fn run_tiled_stereo(
 
         let sub_l = crop_image(left_pprc, tile.pad_x, tile.pad_y, tile.pad_w, tile.pad_h);
         let sub_r = crop_image(right_pprc, tile.pad_x, tile.pad_y, tile.pad_w, tile.pad_h);
+        let sub_guide = left_guide.map(|g| crop_image(g, tile.pad_x, tile.pad_y, tile.pad_w, tile.pad_h));
 
-        let (sub_raw, used_vk) = corr::run_corr(&sub_l, &sub_r, settings, vk);
+        let (sub_raw, used_vk) = corr::run_corr_with_guide(&sub_l, &sub_r, sub_guide.as_ref(), settings, vk);
         if used_vk {
             vk_dispatches += 2;
         }
@@ -160,6 +176,9 @@ pub fn run_tiled_stereo(
         stitch_disparity(&mut disp_raw, &sub_raw, tile);
         stitch_disparity(&mut disp_refined, &sub_ref, tile);
         stitch_disparity(&mut disp_filtered, &sub_flt, tile);
+        disp_raw.is_subpixel = sub_raw.is_subpixel;
+        disp_refined.is_subpixel = sub_ref.is_subpixel;
+        disp_filtered.is_subpixel = sub_flt.is_subpixel;
     }
 
     Ok(TiledDisparityResult {

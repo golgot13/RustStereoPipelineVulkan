@@ -637,8 +637,8 @@ const INDEX_HTML: &str = r##"<!DOCTYPE html>
       <label>Prefilter
         <select id="prefilter">
           <option value="0">None</option>
-          <option value="1">Subtracted Mean</option>
-          <option value="2" selected>LoG (Laplacian)</option>
+          <option value="1" selected>Subtracted Mean</option>
+          <option value="2">LoG (Laplacian)</option>
         </select>
       </label>
       <label>Subpixel

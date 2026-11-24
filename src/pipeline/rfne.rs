@@ -17,7 +17,13 @@ pub fn run_rfne(
 ) -> DisparityMap {
     match settings.subpixel_mode {
         SubpixelMode::None => disp_in.clone(),
-        SubpixelMode::Parabola => refine_parabola(left, right, disp_in, settings),
+        SubpixelMode::Parabola => {
+            if disp_in.is_subpixel {
+                disp_in.clone()
+            } else {
+                refine_parabola(left, right, disp_in, settings)
+            }
+        }
         SubpixelMode::Affine => refine_lucas_kanade(left, right, disp_in, settings, false),
         SubpixelMode::BayesEmAffine => refine_lucas_kanade(left, right, disp_in, settings, true),
     }
@@ -62,7 +68,8 @@ fn refine_parabola(
                         let cmx = patch_cost(left, right, x, y, d0x - 1, d0y, hkw, hkh, s.cost_mode);
                         let cpx = patch_cost(left, right, x, y, d0x + 1, d0y, hkw, hkh, s.cost_mode);
                         let den_x = cmx - 2.0 * c0 + cpx;
-                        let delta_x = if den_x.abs() > 1e-6 {
+                        // Strictly convex local minimum check prevents concave +/-0.5 stair-stepping
+                        let delta_x = if den_x > 1e-6 && cmx >= c0 && cpx >= c0 {
                             (0.5 * (cmx - cpx) / den_x).clamp(-0.5, 0.5)
                         } else {
                             0.0
@@ -72,7 +79,7 @@ fn refine_parabola(
                             let cmy = patch_cost(left, right, x, y, d0x, d0y - 1, hkw, hkh, s.cost_mode);
                             let cpy = patch_cost(left, right, x, y, d0x, d0y + 1, hkw, hkh, s.cost_mode);
                             let den_y = cmy - 2.0 * c0 + cpy;
-                            if den_y.abs() > 1e-6 {
+                            if den_y > 1e-6 && cmy >= c0 && cpy >= c0 {
                                 (0.5 * (cmy - cpy) / den_y).clamp(-0.5, 0.5)
                             } else {
                                 0.0
@@ -88,6 +95,7 @@ fn refine_parabola(
             });
         }
     });
+    out.is_subpixel = true;
     out
 }
 
@@ -122,7 +130,11 @@ fn refine_lucas_kanade(
     let gx_img = ImageF32::from_vec(right.width, right.height, grad_x);
     let gy_img = ImageF32::from_vec(right.width, right.height, grad_y);
 
-    let mut out = refine_parabola(left, right, disp_in, s);
+    let mut out = if disp_in.is_subpixel {
+        disp_in.clone()
+    } else {
+        refine_parabola(left, right, disp_in, s)
+    };
     let initial = out.clone();
 
     std::thread::scope(|scope| {

@@ -179,6 +179,60 @@ impl ImageF32 {
     }
 }
 
+/// 8-bit 3-channel RGB raster image (row-major) used to preserve true color in 3D PLY point clouds.
+#[derive(Debug, Clone)]
+pub struct ImageRgb {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<[u8; 3]>,
+}
+
+impl ImageRgb {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            data: vec![[0, 0, 0]; (width as usize) * (height as usize)],
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, x: u32, y: u32) -> [u8; 3] {
+        self.data[(y as usize) * (self.width as usize) + (x as usize)]
+    }
+
+    #[inline]
+    pub fn set(&mut self, x: u32, y: u32, rgb: [u8; 3]) {
+        self.data[(y as usize) * (self.width as usize) + (x as usize)] = rgb;
+    }
+
+    #[inline]
+    pub fn sample_bilinear_clamped(&self, x: f64, y: f64) -> [u8; 3] {
+        let w = self.width as i32;
+        let h = self.height as i32;
+        if w <= 0 || h <= 0 {
+            return [0, 0, 0];
+        }
+        let ix = (x.floor() as i32).clamp(0, w - 1);
+        let iy = (y.floor() as i32).clamp(0, h - 1);
+        let ix1 = (ix + 1).min(w - 1);
+        let iy1 = (iy + 1).min(h - 1);
+        let fx = (x - ix as f64).clamp(0.0, 1.0) as f32;
+        let fy = (y - iy as f64).clamp(0.0, 1.0) as f32;
+        let c00 = self.data[(iy * w + ix) as usize];
+        let c10 = self.data[(iy * w + ix1) as usize];
+        let c01 = self.data[(iy1 * w + ix) as usize];
+        let c11 = self.data[(iy1 * w + ix1) as usize];
+        let mut out = [0u8; 3];
+        for ch in 0..3 {
+            let top = c00[ch] as f32 * (1.0 - fx) + c10[ch] as f32 * fx;
+            let bot = c01[ch] as f32 * (1.0 - fx) + c11[ch] as f32 * fx;
+            out[ch] = (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 255.0) as u8;
+        }
+        out
+    }
+}
+
 /// 2D Stereo Disparity Map (horizontal `dx`, vertical `dy`, and validity mask).
 #[derive(Debug, Clone)]
 pub struct DisparityMap {
@@ -187,6 +241,8 @@ pub struct DisparityMap {
     pub dx: Vec<f32>,
     pub dy: Vec<f32>,
     pub valid: Vec<u8>,
+    /// True when `dx` already holds aggregated-cost subpixel parabola estimates from SGM/MGM.
+    pub is_subpixel: bool,
 }
 
 impl DisparityMap {
@@ -198,6 +254,7 @@ impl DisparityMap {
             dx: vec![0.0; n],
             dy: vec![0.0; n],
             valid: vec![0; n],
+            is_subpixel: false,
         }
     }
 
@@ -257,7 +314,7 @@ impl DisparityMap {
     }
 }
 
-/// 3D Triangulated Point Cloud with intensity and intersection error.
+/// 3D Triangulated Point Cloud with intensity, optional true RGB color, and intersection error.
 #[derive(Debug, Clone, Default)]
 pub struct PointCloud {
     pub width: u32,
@@ -265,6 +322,7 @@ pub struct PointCloud {
     pub points: Vec<Vec3>,
     pub errors: Vec<f32>,
     pub intensities: Vec<f32>,
+    pub colors: Option<Vec<[u8; 3]>>,
     pub valid: Vec<u8>,
 }
 
@@ -277,7 +335,15 @@ impl PointCloud {
             points: vec![Vec3::ZERO; n],
             errors: vec![0.0; n],
             intensities: vec![0.0; n],
+            colors: None,
             valid: vec![0; n],
+        }
+    }
+
+    /// Attach true RGB colors matching the point cloud's pixel grid.
+    pub fn apply_rgb(&mut self, rgb: &ImageRgb) {
+        if rgb.width == self.width && rgb.height == self.height && rgb.data.len() == self.points.len() {
+            self.colors = Some(rgb.data.clone());
         }
     }
 

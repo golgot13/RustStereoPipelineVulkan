@@ -597,6 +597,8 @@ pub fn build_cost_volume_3d_shader() -> Vec<u32> {
     let f0 = b.const_f32(0.0);
     let f1 = b.const_f32(1.0);
     let f2 = b.const_f32(2.0);
+    let f_w_ncc = b.const_f32(0.65);
+    let f_w_cen = b.const_f32(0.35);
     let f_eps = b.const_f32(1.0e-6);
 
     b.begin_main();
@@ -609,6 +611,7 @@ pub fn build_cost_volume_3d_shader() -> Vec<u32> {
     let var_slr = b.fn_var_f32();
     let var_sll = b.fn_var_f32();
     let var_srr = b.fn_var_f32();
+    let var_cen = b.fn_var_f32();
 
     let (gx, gy) = b.load_global_xy();
     let w = b.load_buf_i32(buf_p, c0, c0);
@@ -647,6 +650,7 @@ pub fn build_cost_volume_3d_shader() -> Vec<u32> {
     let gy_w = b.binop(OP_IMUL, b.ty_i32, gy, w);
     let pix_idx = b.binop(OP_IADD, b.ty_i32, gy_w, gx);
     let vol_base = b.binop(OP_IMUL, b.ty_i32, pix_idx, num_d);
+    let l_center = b.load_buf_f32(buf_l, c0, pix_idx);
 
     b.store(var_di, c0);
     let lbl_d_hdr = b.id();
@@ -679,12 +683,15 @@ pub fn build_cost_volume_3d_shader() -> Vec<u32> {
     b.branch(lbl_merge);
 
     b.label(lbl_in);
+    let r_center_idx = b.binop(OP_IADD, b.ty_i32, gy_w, rx_center);
+    let r_center = b.load_buf_f32(buf_r, c0, r_center_idx);
     b.store(var_acc, f0);
     b.store(var_sl, f0);
     b.store(var_sr, f0);
     b.store(var_slr, f0);
     b.store(var_sll, f0);
     b.store(var_srr, f0);
+    b.store(var_cen, f0);
     b.store(var_ky, neg_hkh);
 
     let lbl_ky_hdr = b.id();
@@ -734,6 +741,15 @@ pub fn build_cost_volume_3d_shader() -> Vec<u32> {
     let next_acc = b.binop(OP_FADD, b.ty_f32, cur_acc, term);
     b.store(var_acc, next_acc);
 
+    // Inline rank/Census bit comparison relative to patch center (zero extra memory traffic)
+    let l_gt = b.binop(OP_FORD_GREATER_THAN, b.ty_bool, lv, l_center);
+    let r_gt = b.binop(OP_FORD_GREATER_THAN, b.ty_bool, rv, r_center);
+    let cen_mis = b.binop(OP_LOGICAL_NOT_EQUAL, b.ty_bool, l_gt, r_gt);
+    let cen_inc = b.select(b.ty_f32, cen_mis, f1, f0);
+    let cur_cen = b.load(b.ty_f32, var_cen);
+    let next_cen = b.binop(OP_FADD, b.ty_f32, cur_cen, cen_inc);
+    b.store(var_cen, next_cen);
+
     // Accumulate zero-mean NCC moments
     let c_sl = b.load(b.ty_f32, var_sl);
     let c_sr = b.load(b.ty_f32, var_sr);
@@ -771,6 +787,8 @@ pub fn build_cost_volume_3d_shader() -> Vec<u32> {
     b.label(lbl_ky_end);
     let acc_val = b.load(b.ty_f32, var_acc);
     let sad_ssd_norm = b.binop(OP_FDIV, b.ty_f32, acc_val, cnt_f);
+    let cen_val = b.load(b.ty_f32, var_cen);
+    let cen_norm = b.binop(OP_FDIV, b.ty_f32, cen_val, cnt_f);
     let sl = b.load(b.ty_f32, var_sl);
     let sr = b.load(b.ty_f32, var_sr);
     let slr = b.load(b.ty_f32, var_slr);
@@ -794,8 +812,14 @@ pub fn build_cost_volume_3d_shader() -> Vec<u32> {
     let ncc_cost_raw = b.binop(OP_FSUB, b.ty_f32, f1, ncc);
     let ncc_clamped_lo = b.glsl2(GLSL_FMAX, b.ty_f32, ncc_cost_raw, f0);
     let ncc_cost = b.glsl2(GLSL_FMIN, b.ty_f32, ncc_clamped_lo, f2);
+    // Hybrid ZNCC + Census cost suppresses dark/shadow & periodic parking-lot mismatches
+    let ncc_w = b.binop(OP_FMUL, b.ty_f32, ncc_cost, f_w_ncc);
+    let cen_w = b.binop(OP_FMUL, b.ty_f32, cen_norm, f_w_cen);
+    let hybrid_ncc = b.binop(OP_FADD, b.ty_f32, ncc_w, cen_w);
     let is_ncc = b.binop(OP_IEQUAL, b.ty_bool, cost_mode, c2);
-    let final_cost = b.select(b.ty_f32, is_ncc, ncc_cost, sad_ssd_norm);
+    let is_cen = b.binop(OP_IEQUAL, b.ty_bool, cost_mode, c3);
+    let ncc_or_sad = b.select(b.ty_f32, is_ncc, hybrid_ncc, sad_ssd_norm);
+    let final_cost = b.select(b.ty_f32, is_cen, cen_norm, ncc_or_sad);
     b.store_buf_f32(buf_vol, c0, vol_idx, final_cost);
     b.branch(lbl_merge);
 

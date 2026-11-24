@@ -204,6 +204,30 @@ impl GeoTiffReader {
 
     /// Decode ONLY the strips or tiles intersecting the 1:1 ROI `[x0..x0+w, y0..y0+h]`.
     pub fn read_roi(&self, x0: u32, y0: u32, roi_w: u32, roi_h: u32) -> Result<ImageF32> {
+        let (gray, _) = self.read_roi_internal(x0, y0, roi_w, roi_h, false)?;
+        Ok(gray)
+    }
+
+    /// Decode the 1:1 ROI returning both luminance `ImageF32` and optional true-color `ImageRgb`
+    /// when the source GeoTIFF has `>= 3` bands (single disk pass, zero extra I/O).
+    pub fn read_roi_with_rgb(
+        &self,
+        x0: u32,
+        y0: u32,
+        roi_w: u32,
+        roi_h: u32,
+    ) -> Result<(ImageF32, Option<crate::image::ImageRgb>)> {
+        self.read_roi_internal(x0, y0, roi_w, roi_h, self.meta.samples_per_pixel >= 3)
+    }
+
+    fn read_roi_internal(
+        &self,
+        x0: u32,
+        y0: u32,
+        roi_w: u32,
+        roi_h: u32,
+        keep_rgb: bool,
+    ) -> Result<(ImageF32, Option<crate::image::ImageRgb>)> {
         let m = &self.meta;
         if x0 >= m.width || y0 >= m.height || roi_w == 0 || roi_h == 0 {
             return Err(PipelineError::Format(format!(
@@ -214,6 +238,11 @@ impl GeoTiffReader {
         let w = roi_w.min(m.width - x0);
         let h = roi_h.min(m.height - y0);
         let mut out = ImageF32::new(w, h);
+        let mut out_rgb = if keep_rgb && m.samples_per_pixel >= 3 {
+            Some(crate::image::ImageRgb::new(w, h))
+        } else {
+            None
+        };
         let mut f = File::open(&m.path)?;
 
         let bytes_per_sample = (m.bits_per_sample as usize) / 8;
@@ -280,8 +309,10 @@ impl GeoTiffReader {
                             m.sample_format,
                             m.little_endian,
                             is_planar,
+                            band,
                             bands_to_read,
                             &mut out,
+                            out_rgb.as_mut(),
                         );
                     }
                 }
@@ -332,18 +363,24 @@ impl GeoTiffReader {
                         m.sample_format,
                         m.little_endian,
                         is_planar,
+                        band,
                         bands_to_read,
                         &mut out,
+                        out_rgb.as_mut(),
                     );
                 }
             }
         }
 
-        Ok(out)
+        Ok((out, out_rgb))
     }
 
     pub fn read_full(&self) -> Result<ImageF32> {
         self.read_roi(0, 0, self.meta.width, self.meta.height)
+    }
+
+    pub fn read_full_with_rgb(&self) -> Result<(ImageF32, Option<crate::image::ImageRgb>)> {
+        self.read_roi_with_rgb(0, 0, self.meta.width, self.meta.height)
     }
 }
 
@@ -364,8 +401,10 @@ fn copy_block_to_roi(
     sample_format: u16,
     le: bool,
     is_planar: bool,
+    band: usize,
     planar_bands: usize,
     out: &mut ImageF32,
+    mut out_rgb: Option<&mut crate::image::ImageRgb>,
 ) {
     let pixel_stride = samples_in_block * bps_bytes;
     let ch_count = samples_in_block.min(3);
@@ -381,11 +420,35 @@ fn copy_block_to_roi(
             }
             let val = if is_planar {
                 let s = decode_sample(&raw[base..base + bps_bytes], bps_bytes, sample_format, le);
-                out.get(rx, ry) + s / planar_bands as f32
+                if let Some(ref mut rgb) = out_rgb {
+                    if band < 3 {
+                        let mut cur = rgb.get(rx, ry);
+                        cur[band] = (s.clamp(0.0, 1.0) * 255.0).round() as u8;
+                        rgb.set(rx, ry, cur);
+                    }
+                }
+                let wt = match (planar_bands, band) {
+                    (3, 0) => 0.299,
+                    (3, 1) => 0.587,
+                    (3, 2) => 0.114,
+                    _ => 1.0 / planar_bands.max(1) as f32,
+                };
+                out.get(rx, ry) + s * wt
             } else if ch_count == 3 {
                 let r = decode_sample(&raw[base..base + bps_bytes], bps_bytes, sample_format, le);
                 let g = decode_sample(&raw[base + bps_bytes..base + 2 * bps_bytes], bps_bytes, sample_format, le);
                 let b = decode_sample(&raw[base + 2 * bps_bytes..base + 3 * bps_bytes], bps_bytes, sample_format, le);
+                if let Some(ref mut rgb) = out_rgb {
+                    rgb.set(
+                        rx,
+                        ry,
+                        [
+                            (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                        ],
+                    );
+                }
                 0.299 * r + 0.587 * g + 0.114 * b
             } else {
                 decode_sample(&raw[base..base + bps_bytes], bps_bytes, sample_format, le)

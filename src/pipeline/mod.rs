@@ -116,7 +116,7 @@ impl StereoPipelineEngine {
 
         progress("Stage 1/5: stereo_corr (Stereo Matching & LR Check)", 0.22);
         let t1 = Instant::now();
-        let (disp_raw, used_vk1) = corr::run_corr(&left_pprc, &right_pprc, settings, vk);
+        let (disp_raw, used_vk1) = corr::run_corr_with_guide(&left_pprc, &right_pprc, Some(left), settings, vk);
         let corr_ms = t1.elapsed().as_secs_f64() * 1000.0;
         if used_vk1 { vk_dispatches += 2; }
 

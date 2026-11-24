@@ -2,14 +2,25 @@
 //! Supports SAD, SSD, zero-mean NCC, and 5x5 Census cost metrics + Left-Right consistency check.
 //! Executes on Vulkan Compute GPU when available, or multi-threaded CPU (`std::thread::scope`).
 
-use crate::config::{CostMode, StereoAlgorithm, StereoSettings};
+use crate::config::{CostMode, StereoAlgorithm, StereoSettings, SubpixelMode};
 use crate::image::{DisparityMap, ImageF32};
 use crate::vulkan::VulkanCompute;
 
-/// Run Stage 1 stereo correlation returning an integer disparity map and a flag indicating Vulkan GPU execution.
+/// Run Stage 1 stereo correlation returning a disparity map and a flag indicating Vulkan GPU execution.
 pub fn run_corr(
     left: &ImageF32,
     right: &ImageF32,
+    settings: &StereoSettings,
+    vk: Option<&VulkanCompute>,
+) -> (DisparityMap, bool) {
+    run_corr_with_guide(left, right, None, settings, vk)
+}
+
+/// Run Stage 1 stereo correlation with an optional raw radiometric left guide image for edge-aware SGM.
+pub fn run_corr_with_guide(
+    left: &ImageF32,
+    right: &ImageF32,
+    left_guide: Option<&ImageF32>,
     settings: &StereoSettings,
     vk: Option<&VulkanCompute>,
 ) -> (DisparityMap, bool) {
@@ -59,8 +70,8 @@ pub fn run_corr(
     // Build cost volume & solve using selected algorithm (BM / SGM / MGM)
     match settings.stereo_algorithm {
         StereoAlgorithm::AspBm => (correlate_bm_cpu(left, right, settings), false),
-        StereoAlgorithm::AspSgm => correlate_sgm(left, right, settings, false, vk),
-        StereoAlgorithm::AspMgm => correlate_sgm(left, right, settings, true, vk),
+        StereoAlgorithm::AspSgm => correlate_sgm(left, right, left_guide, settings, false, vk),
+        StereoAlgorithm::AspMgm => correlate_sgm(left, right, left_guide, settings, true, vk),
     }
 }
 
@@ -354,11 +365,13 @@ fn census_patch_cost(
 }
 
 /// Semi-Global Matching (ASP SGM) & More Global Matching (ASP MGM) with GPU Vulkan Compute
-/// 3D cost volume acceleration (with automatic AVX2 multi-thread CPU fallback) + 4-direction
-/// dynamic programming (or 2D quadrant aggregation for MGM) + LR consistency check.
+/// 3D cost volume acceleration (with automatic AVX2 multi-thread CPU fallback), 8-path edge-aware
+/// dynamic programming using raw radiometric guide gradients, texture-aware uniqueness filtering,
+/// LR consistency check, and exact subpixel parabola fitting on the aggregated SGM cost volume.
 fn correlate_sgm(
     left: &ImageF32,
     right: &ImageF32,
+    left_guide: Option<&ImageF32>,
     s: &StereoSettings,
     use_mgm: bool,
     vk: Option<&VulkanCompute>,
@@ -373,46 +386,47 @@ fn correlate_sgm(
     let n_threads = s.threads.clamp(1, h.max(1));
     let rows_per = (h + n_threads - 1) / n_threads;
 
-    // 1. Build 3D matching cost volume C[y][x][d] on Vulkan GPU when available, else AVX2 CPU
+    let guide = match left_guide {
+        Some(g) if g.width == left.width && g.height == left.height => g,
+        _ => left,
+    };
+
+    // 1. Build 3D matching cost volume C[y][x][d] on Vulkan GPU (supports SAD, SSD, hybrid NCC+Census, Census)
     let mut used_vk = false;
-    let cost_vol: Vec<f32> = if s.cost_mode != CostMode::Census {
-        if let Some(gpu) = vk {
-            match gpu.run_stereo_cost_volume(
-                &left.data,
-                &right.data,
-                left.width,
-                left.height,
-                hkw,
-                hkh,
-                min_d,
-                num_d,
-                s.cost_mode as i32,
-            ) {
-                Ok(vol) if vol.len() == w * h * num_d => {
-                    used_vk = true;
-                    vol
-                }
-                _ => build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per),
+    let cost_vol: Vec<f32> = if let Some(gpu) = vk {
+        match gpu.run_stereo_cost_volume(
+            &left.data,
+            &right.data,
+            left.width,
+            left.height,
+            hkw,
+            hkh,
+            min_d,
+            num_d,
+            s.cost_mode as i32,
+        ) {
+            Ok(vol) if vol.len() == w * h * num_d => {
+                used_vk = true;
+                vol
             }
-        } else {
-            build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per)
+            _ => build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per),
         }
     } else {
         build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per)
     };
 
     // 2. 8-path Edge-Aware SGM / MGM cost aggregation using L2-cache-friendly 2-row DP buffers
-    //    (eliminates 170 MB per-path allocations and suppresses periodic parking-stall aliasing via gradient-adaptive P2)
+    //    Uses raw radiometric guide gradients so P2 stays strong on flat asphalt and drops cleanly at real edges.
     let p1 = s.sgm_p1;
     let p2_base = s.sgm_p2;
     let mut agg = vec![0.0f32; w * h * num_d];
 
-    // 2a. Horizontal passes (+X and -X) parallelized across all CPU threads directly into agg rows!
+    // 2a. Horizontal passes (+X and -X) parallelized across all CPU threads directly into agg rows
     std::thread::scope(|scope| {
         for (t, agg_chunk) in agg.chunks_mut(rows_per * w * num_d).enumerate() {
             let y_start = t * rows_per;
             let cv = &cost_vol;
-            let ldata = &left.data;
+            let gdata = &guide.data;
             scope.spawn(move || {
                 let rows = agg_chunk.len() / (w * num_d);
                 let mut prev_l = vec![0.0f32; num_d];
@@ -430,8 +444,8 @@ fn correlate_sgm(
                         agg_chunk[row_agg + d] += c;
                     }
                     for x in 1..w {
-                        let grad = (ldata[row_pix + x] - ldata[row_pix + x - 1]).abs();
-                        let p2_eff = (p2_base / (1.0 + 8.0 * grad)).max(p1 * 1.5);
+                        let grad = (gdata[row_pix + x] - gdata[row_pix + x - 1]).abs();
+                        let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
                         let mut min_prev = f32::INFINITY;
                         for d in 0..num_d {
                             if prev_l[d] < min_prev { min_prev = prev_l[d]; }
@@ -458,8 +472,8 @@ fn correlate_sgm(
                         agg_chunk[row_agg + last_off + d] += c;
                     }
                     for x in (0..w - 1).rev() {
-                        let grad = (ldata[row_pix + x] - ldata[row_pix + x + 1]).abs();
-                        let p2_eff = (p2_base / (1.0 + 8.0 * grad)).max(p1 * 1.5);
+                        let grad = (gdata[row_pix + x] - gdata[row_pix + x + 1]).abs();
+                        let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
                         let mut min_prev = f32::INFINITY;
                         for d in 0..num_d {
                             if prev_l[d] < min_prev { min_prev = prev_l[d]; }
@@ -482,7 +496,7 @@ fn correlate_sgm(
         }
     });
 
-    // 2b. Vertical & Diagonal passes (+Y, -Y, +1/+1, -1/+1, +1/-1, -1/-1) with compact 2-row L2-cache buffers!
+    // 2b. Vertical & Diagonal passes (+Y, -Y, +1/+1, -1/+1, +1/-1, -1/-1) with compact 2-row L2-cache buffers
     let vd_dirs: &[(i32, i32)] = &[(0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
     let mut prev_row = vec![0.0f32; w * num_d];
     let mut cur_row = vec![0.0f32; w * num_d];
@@ -524,8 +538,8 @@ fn correlate_sgm(
                     let px_u = px as usize;
                     let p_off = px_u * num_d;
                     let min_prev = prev_mins[px_u];
-                    let grad = (left.data[row_pix + x] - left.data[py as usize * w + px_u]).abs();
-                    let p2_eff = (p2_base / (1.0 + 8.0 * grad)).max(p1 * 1.5);
+                    let grad = (guide.data[row_pix + x] - guide.data[py as usize * w + px_u]).abs();
+                    let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
                     let mp2 = min_prev + p2_eff;
 
                     // For MGM, blend perpendicular already-visited neighbor on current row
@@ -567,24 +581,31 @@ fn correlate_sgm(
         }
     }
 
-    // 3. Parallel Winner-Takes-All + Uniqueness Ratio (suppresses periodic aliasing) + implicit R->L WTA
-    let mut dx_lr = vec![0.0f32; w * h];
+    // 3. Parallel WTA + Aggregated-Cost Subpixel Parabola + Texture-Aware Uniqueness + Implicit R->L WTA
+    let do_subpixel = s.subpixel_mode != SubpixelMode::None;
+    let mut dx_lr_int = vec![0.0f32; w * h];
+    let mut dx_lr_sub = vec![0.0f32; w * h];
     let mut dx_rl = vec![0.0f32; w * h];
     let mut unique_ok = vec![1u8; w * h];
 
     std::thread::scope(|scope| {
-        for (t, ((lr_c, rl_c), uq_c)) in dx_lr
+        for (t, (((lr_i, lr_s), rl_c), uq_c)) in dx_lr_int
             .chunks_mut(rows_per * w)
+            .zip(dx_lr_sub.chunks_mut(rows_per * w))
             .zip(dx_rl.chunks_mut(rows_per * w))
             .zip(unique_ok.chunks_mut(rows_per * w))
             .enumerate()
         {
             let y_start = t * rows_per;
             let ag = &agg;
+            let cv = &cost_vol;
+            let gdata = &guide.data;
             scope.spawn(move || {
-                let rows = lr_c.len() / w;
+                let rows = lr_i.len() / w;
                 for ly in 0..rows {
                     let y = y_start + ly;
+                    let ym = y.saturating_sub(1);
+                    let yp = (y + 1).min(h - 1);
                     for x in 0..w {
                         let base = (y * w + x) * num_d;
                         let mut best_c = f32::INFINITY;
@@ -596,7 +617,41 @@ fn correlate_sgm(
                                 best_di = di;
                             }
                         }
-                        // Uniqueness check: reject strongly ambiguous periodic matches (|di - best_di| >= 4)
+
+                        // Unbiased subpixel parabola around SGM-regularized `best_di`:
+                        // Prefer raw `cost_vol` when strictly convex (avoids SGM +16*P1 pixel-locking bias),
+                        // falling back to strictly convex `agg` parabola on low-texture surfaces.
+                        let d_int = (min_d + best_di as i32) as f32;
+                        let mut d_sub = d_int;
+                        if do_subpixel && best_di > 0 && best_di + 1 < num_d {
+                            let rc0 = cv[base + best_di];
+                            let rcm = cv[base + best_di - 1];
+                            let rcp = cv[base + best_di + 1];
+                            let rden = rcm - 2.0 * rc0 + rcp;
+                            if rden > 1e-5 && rcm >= rc0 && rcp >= rc0 {
+                                d_sub += (0.5 * (rcm - rcp) / rden).clamp(-0.5, 0.5);
+                            } else {
+                                let cm = ag[base + best_di - 1];
+                                let cp = ag[base + best_di + 1];
+                                let den = cm - 2.0 * best_c + cp;
+                                if den > 1e-6 && cm >= best_c && cp >= best_c {
+                                    d_sub += (0.5 * (cm - cp) / den).clamp(-0.5, 0.5);
+                                }
+                            }
+                        }
+
+                        // Local radiometric texture contrast (3x3 max neighbor diff on guide image)
+                        let xm = x.saturating_sub(1);
+                        let xp = (x + 1).min(w - 1);
+                        let gc = gdata[y * w + x];
+                        let local_tex = (gdata[y * w + xm] - gc)
+                            .abs()
+                            .max((gdata[y * w + xp] - gc).abs())
+                            .max((gdata[ym * w + x] - gc).abs())
+                            .max((gdata[yp * w + x] - gc).abs());
+
+                        // Texture-aware uniqueness check: reject ambiguous periodic peaks on textured regions
+                        // and search-boundary locks, while letting SGM smoothly bridge uniform asphalt/stalls
                         let mut second_c = f32::INFINITY;
                         for di in 0..num_d {
                             if di.abs_diff(best_di) >= 4 {
@@ -606,11 +661,15 @@ fn correlate_sgm(
                                 }
                             }
                         }
+
                         let loc = ly * w + x;
-                        lr_c[loc] = (min_d + best_di as i32) as f32;
+                        lr_i[loc] = d_int;
+                        lr_s[loc] = d_sub;
                         if num_d >= 16 && second_c.is_finite() && best_c > 1e-4 {
-                            // Require at least 0.6% margin over distant rival peak
-                            if second_c < best_c * 1.006 {
+                            let at_border = best_di == 0 || best_di + 1 == num_d;
+                            if at_border && second_c < best_c * 1.01 {
+                                uq_c[loc] = 0;
+                            } else if local_tex > 0.035 && second_c < best_c * 1.0035 {
                                 uq_c[loc] = 0;
                             }
                         }
@@ -636,12 +695,14 @@ fn correlate_sgm(
     });
 
     let mut disp = DisparityMap::new(left.width, left.height);
-    apply_lr_check(left.width, left.height, &dx_lr, &dx_rl, s.lr_threshold, &mut disp);
+    apply_lr_check(left.width, left.height, &dx_lr_int, &dx_rl, s.lr_threshold, &mut disp);
     for i in 0..disp.valid.len() {
+        disp.dx[i] = dx_lr_sub[i];
         if unique_ok[i] == 0 {
             disp.valid[i] = 0;
         }
     }
+    disp.is_subpixel = do_subpixel;
     (disp, used_vk)
 }
 
@@ -682,11 +743,12 @@ fn build_cost_volume_cpu(
                                 CostMode::Census => {
                                     census_patch_cost(cl, cr, w as i32, h as i32, x, y, d, 0, hkw.min(2), hkh.min(2))
                                 }
-                                _ => {
+                                CostMode::Ncc => {
                                     let pc = patch_cost(left, right, x, y, d, 0, hkw, hkh, s.cost_mode);
                                     let cc = census_patch_cost(cl, cr, w as i32, h as i32, x, y, d, 0, 1, 1);
-                                    0.7 * pc + 0.3 * cc
+                                    0.65 * pc + 0.35 * cc
                                 }
+                                _ => patch_cost(left, right, x, y, d, 0, hkw, hkh, s.cost_mode),
                             };
                             chunk[base + di] = c;
                         }
@@ -722,5 +784,66 @@ fn apply_lr_check(
             out.dx[idx] = d;
             out.valid[idx] = if consistent { 1 } else { 0 };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::pprc;
+
+    #[test]
+    fn test_sgm_aggregated_subpixel_fractional_continuity() {
+        let w = 64u32;
+        let h = 48u32;
+        let mut left = ImageF32::new(w, h);
+        let mut right = ImageF32::new(w, h);
+        let true_dx = -3.4f32;
+        let tex = |x: f32, y: f32| -> f32 {
+            0.5 + 0.25 * (x * 0.45).sin() * (y * 0.37).cos()
+                + 0.15 * (x * 1.13 + y * 0.71).sin()
+                + 0.10 * ((x * 0.83).cos() - (y * 0.91).sin())
+        };
+        for y in 0..h {
+            for x in 0..w {
+                left.set(x, y, tex(x as f32, y as f32));
+                right.set(x, y, tex(x as f32 - true_dx, y as f32));
+            }
+        }
+        let mut s = StereoSettings::default();
+        s.stereo_algorithm = StereoAlgorithm::AspSgm;
+        s.cost_mode = CostMode::Ncc;
+        s.subpixel_mode = SubpixelMode::Parabola;
+        s.search_min_x = -12;
+        s.search_max_x = 4;
+        s.search_min_y = 0;
+        s.search_max_y = 0;
+        s.corr_kernel_x = 7;
+        s.corr_kernel_y = 7;
+
+        let (lp, rp, _) = pprc::run_pprc(&left, &right, &s, None);
+        let (disp, _) = run_corr_with_guide(&lp, &rp, Some(&left), &s, None);
+        assert!(disp.is_subpixel);
+
+        let mut err_sum = 0.0f64;
+        let mut frac_cnt = 0usize;
+        let mut cnt = 0usize;
+        for y in 8..(h - 8) {
+            for x in 14..(w - 14) {
+                let idx = disp.idx(x, y);
+                if disp.valid[idx] != 0 {
+                    let d = disp.dx[idx];
+                    err_sum += (d - true_dx).abs() as f64;
+                    if (d - d.round()).abs() > 0.15 {
+                        frac_cnt += 1;
+                    }
+                    cnt += 1;
+                }
+            }
+        }
+        assert!(cnt > 800, "Too few valid interior pixels: {}", cnt);
+        let mae = err_sum / cnt as f64;
+        assert!(mae < 0.15, "Subpixel SGM MAE too high for -3.4 px shift: {:.4}", mae);
+        assert!(frac_cnt * 2 > cnt, "Expected continuous fractional subpixel estimates, got {}/{}", frac_cnt, cnt);
     }
 }

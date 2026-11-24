@@ -75,6 +75,7 @@ struct StereoEguiApp {
     engine: Arc<StereoPipelineEngine>,
     hw: HardwareProfile,
     left: ImageF32,
+    left_rgb: Option<crate::image::ImageRgb>,
     right: ImageF32,
     cam_left: AnyCamera,
     cam_right: AnyCamera,
@@ -182,6 +183,7 @@ impl StereoEguiApp {
             engine,
             hw,
             left,
+            left_rgb: None,
             right,
             cam_left,
             cam_right,
@@ -241,6 +243,7 @@ impl StereoEguiApp {
 
         let engine = Arc::clone(&self.engine);
         let left = self.left.clone();
+        let left_rgb = self.left_rgb.clone();
         let right = self.right.clone();
         let cl = self.cam_left.clone();
         let cr = self.cam_right.clone();
@@ -251,9 +254,10 @@ impl StereoEguiApp {
         std::thread::spawn(move || {
             let tx_ev = tx.clone();
             let ctx_ev = repaint_ctx.clone();
-            let outcome = WorkflowExecutor::execute_in_memory(
+            let outcome = WorkflowExecutor::execute_in_memory_with_rgb(
                 &job,
                 &left,
+                left_rgb.as_ref(),
                 &right,
                 &cl,
                 &cr,
@@ -339,6 +343,7 @@ impl StereoEguiApp {
     fn generate_synthetic(&mut self, w: u32, h: u32, ctx: &egui::Context) {
         let ds = synthetic::generate_synthetic_stereo(w, h);
         self.left = ds.left_image;
+        self.left_rgb = None;
         self.right = ds.right_image;
         self.cam_left = ds.left_cam;
         self.cam_right = ds.right_cam;
@@ -350,8 +355,8 @@ impl StereoEguiApp {
     }
 
     fn load_from_paths(&mut self, ctx: &egui::Context) {
-        let l = match load_image(Path::new(self.left_path.trim())) {
-            Ok(img) => img,
+        let (l, l_rgb) = match crate::image::io::load_image_with_rgb(Path::new(self.left_path.trim())) {
+            Ok(pair) => pair,
             Err(e) => {
                 self.log(format!("Error loading left image: {}", e));
                 return;
@@ -379,6 +384,7 @@ impl StereoEguiApp {
             }
         };
         self.left = l;
+        self.left_rgb = l_rgb;
         self.right = r;
         self.cam_left = cl;
         self.cam_right = cr;
@@ -410,6 +416,7 @@ impl StereoEguiApp {
         match crate::core::chantier::prepare_stereo_pair_roi(&chantier, pair, self.chantier_roi_size) {
             Ok(roi) => {
                 self.left = roi.left_img;
+                self.left_rgb = roi.left_rgb;
                 self.right = roi.right_img;
                 self.cam_left = roi.left_cam;
                 self.cam_right = roi.right_cam;

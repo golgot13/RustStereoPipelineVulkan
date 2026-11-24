@@ -195,8 +195,8 @@ impl Default for StereoSettings {
         Self {
             alignment_method: "epipolar".to_string(),
             normalize_intensity: true,
-            prefilter_mode: PrefilterMode::LaplacianOfGaussian,
-            prefilter_kernel_width: 1.4,
+            prefilter_mode: PrefilterMode::SubtractedMean,
+            prefilter_kernel_width: 7.0,
 
             stereo_algorithm: StereoAlgorithm::AspSgm,
             cost_mode: CostMode::Ncc,

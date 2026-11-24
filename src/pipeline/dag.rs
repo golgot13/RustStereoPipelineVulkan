@@ -305,25 +305,40 @@ impl WorkflowExecutor {
         cancel: &CancellationToken,
         on_event: impl FnMut(WorkflowEvent),
     ) -> Result<WorkflowOutput> {
-        let (left, right, cam_l, cam_r, gt_disp) = match &spec.input {
+        let (left, left_rgb, right, cam_l, cam_r, gt_disp) = match &spec.input {
             JobInput::Files {
                 left_image,
                 right_image,
                 left_camera,
                 right_camera,
-            } => (
-                load_image(Path::new(left_image))?,
-                load_image(Path::new(right_image))?,
-                load_camera(Path::new(left_camera))?,
-                load_camera(Path::new(right_camera))?,
-                None,
-            ),
+            } => {
+                let (l_img, l_rgb) = crate::image::io::load_image_with_rgb(Path::new(left_image))?;
+                (
+                    l_img,
+                    l_rgb,
+                    load_image(Path::new(right_image))?,
+                    load_camera(Path::new(left_camera))?,
+                    load_camera(Path::new(right_camera))?,
+                    None,
+                )
+            }
             JobInput::Synthetic { width, height } => {
                 let ds = synthetic::generate_synthetic_stereo(*width, *height);
-                (ds.left_image, ds.right_image, ds.left_cam, ds.right_cam, Some(ds.gt_disparity))
+                (ds.left_image, None, ds.right_image, ds.left_cam, ds.right_cam, Some(ds.gt_disparity))
             }
         };
-        Self::execute_in_memory(spec, &left, &right, &cam_l, &cam_r, gt_disp, engine, cancel, on_event)
+        Self::execute_in_memory_with_rgb(
+            spec,
+            &left,
+            left_rgb.as_ref(),
+            &right,
+            &cam_l,
+            &cam_r,
+            gt_disp,
+            engine,
+            cancel,
+            on_event,
+        )
     }
 
     /// Execute the modular DAG on already-loaded rasters & cameras (used directly by `egui`, X11, and Web UI).
@@ -331,6 +346,34 @@ impl WorkflowExecutor {
     pub fn execute_in_memory(
         spec: &JobSpec,
         left: &ImageF32,
+        right: &ImageF32,
+        cam_l: &AnyCamera,
+        cam_r: &AnyCamera,
+        gt_disparity: Option<DisparityMap>,
+        engine: &StereoPipelineEngine,
+        cancel: &CancellationToken,
+        on_event: impl FnMut(WorkflowEvent),
+    ) -> Result<WorkflowOutput> {
+        Self::execute_in_memory_with_rgb(
+            spec,
+            left,
+            None,
+            right,
+            cam_l,
+            cam_r,
+            gt_disparity,
+            engine,
+            cancel,
+            on_event,
+        )
+    }
+
+    /// Execute the modular DAG on already-loaded rasters & cameras with optional true-color RGB for PLY export.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_in_memory_with_rgb(
+        spec: &JobSpec,
+        left: &ImageF32,
+        left_rgb: Option<&crate::image::ImageRgb>,
         right: &ImageF32,
         cam_l: &AnyCamera,
         cam_r: &AnyCamera,
@@ -409,9 +452,10 @@ impl WorkflowExecutor {
         let (disp_raw, disp_refined, disp_filtered) = if spec.to_stage >= StageId::Corr {
             on_event(WorkflowEvent::StageStart { stage: StageId::Corr, label: StageId::Corr.label().into(), pct: 0.20 });
             let t_stereo = Instant::now();
-            let tiled = tiling::run_tiled_stereo(
+            let tiled = tiling::run_tiled_stereo_with_guide(
                 &left_pprc,
                 &right_pprc,
+                Some(left),
                 &spec.settings,
                 spec.tile_size,
                 vk,
@@ -450,7 +494,10 @@ impl WorkflowExecutor {
         let mut point_cloud = if spec.to_stage >= StageId::Tri {
             on_event(WorkflowEvent::StageStart { stage: StageId::Tri, label: StageId::Tri.label().into(), pct: 0.82 });
             let t4 = Instant::now();
-            let pc = tri::run_tri(left, &disp_filtered, cam_l, cam_r, &spec.settings);
+            let mut pc = tri::run_tri(left, &disp_filtered, cam_l, cam_r, &spec.settings);
+            if let Some(rgb) = left_rgb {
+                pc.apply_rgb(rgb);
+            }
             tri_ms = t4.elapsed().as_secs_f64() * 1000.0;
             on_event(WorkflowEvent::StageComplete { stage: StageId::Tri, duration_ms: tri_ms, pct: 0.90 });
             pc

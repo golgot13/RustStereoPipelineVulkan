@@ -126,8 +126,8 @@ STEREO OPTIONS:
   -s, --stereo-file <file>       Load ASP stereo.default configuration file
   --stereo-algorithm <alg>       asp_bm | asp_sgm | asp_mgm (default: asp_sgm)
   --cost-mode <0|1|2|3>          0=SAD, 1=SSD, 2=NCC, 3=Census (default: 2)
-  --prefilter-mode <0|1|2>       0=None, 1=SubMean, 2=LoG (default: 2)
-  --prefilter-kernel-width <f>   Prefilter sigma/width (default: 1.4)
+  --prefilter-mode <0|1|2>       0=None, 1=SubMean, 2=LoG (default: 1)
+  --prefilter-kernel-width <f>   Prefilter sigma/width (default: 7.0)
   --corr-kernel <W> <H>          Correlation patch size (default: 9 9)
   --corr-search <minX minY maxX maxY>  Disparity search box
   --subpixel-mode <0|1|2|3>      0=None, 1=Parabola, 2=BayesEM, 3=Affine (default: 1)
@@ -590,9 +590,10 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         spec.settings.search_max_y = eff_search.3;
         spec.save_file(Path::new(&format!("{}-job.json", out_prefix)))?;
 
-        let out = WorkflowExecutor::execute_in_memory(
+        let out = WorkflowExecutor::execute_in_memory_with_rgb(
             &spec,
             &roi.left_img,
+            roi.left_rgb.as_ref(),
             &roi.right_img,
             &roi.left_cam,
             &roi.right_cam,
@@ -867,6 +868,7 @@ fn cmd_point2dem(args: &[String]) -> Result<()> {
         points: pts,
         errors: vec![0.0; n],
         intensities: vec![0.5; n],
+        colors: None,
         valid: vec![1; n],
     };
     let engine = StereoPipelineEngine::new(p.settings.backend);

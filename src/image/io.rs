@@ -11,27 +11,33 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
-use super::{Colormap, DisparityMap, ImageF32, PointCloud};
+use super::{Colormap, DisparityMap, ImageF32, ImageRgb, PointCloud};
 
 /// Load a grayscale f32 image by inspecting file magic bytes / extension.
 /// Supports Classic TIFF & BigTIFF (Uncompressed, LZW, Deflate, PackBits, Strip & Tiled), PFM, PGM/PPM, BMP.
 pub fn load_image(path: &Path) -> io::Result<ImageF32> {
+    let (img, _) = load_image_with_rgb(path)?;
+    Ok(img)
+}
+
+/// Load a grayscale f32 image plus optional true-color `ImageRgb` (for 3/4-band TIFF/GeoTIFF, P6 PPM, 24/32-bit BMP).
+pub fn load_image_with_rgb(path: &Path) -> io::Result<(ImageF32, Option<ImageRgb>)> {
     let mut f = File::open(path)?;
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic[0..2] == b"II" || &magic[0..2] == b"MM" {
         return crate::image::geotiff::GeoTiffReader::open(path)
-            .and_then(|r| r.read_full())
+            .and_then(|r| r.read_full_with_rgb())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
     }
     let mut bytes = Vec::from(magic);
     f.read_to_end(&mut bytes)?;
     if &bytes[0..2] == b"Pf" || &bytes[0..2] == b"PF" {
-        decode_pfm(&bytes)
+        Ok((decode_pfm(&bytes)?, None))
     } else if &bytes[0..2] == b"P5" || &bytes[0..2] == b"P6" || &bytes[0..2] == b"P2" {
-        decode_pnm(&bytes)
+        Ok((decode_pnm(&bytes)?, None))
     } else if &bytes[0..2] == b"BM" {
-        decode_bmp(&bytes)
+        Ok((decode_bmp(&bytes)?, None))
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -692,13 +698,19 @@ pub fn save_point_cloud_ply(path: &Path, pc: &PointCloud) -> io::Result<()> {
     for i in 0..pc.points.len() {
         if pc.valid[i] != 0 {
             let p = pc.points[i];
-            let g = (pc.intensities[i].clamp(0.0, 1.0) * 255.0).round() as u8;
+            let [r, g, b] = match pc.colors.as_ref().and_then(|c| c.get(i)) {
+                Some(&rgb) => rgb,
+                None => {
+                    let gray = (pc.intensities[i].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    [gray, gray, gray]
+                }
+            };
             buf.extend_from_slice(&p.x.to_le_bytes());
             buf.extend_from_slice(&p.y.to_le_bytes());
             buf.extend_from_slice(&p.z.to_le_bytes());
+            buf.push(r);
             buf.push(g);
-            buf.push(g);
-            buf.push(g);
+            buf.push(b);
             buf.extend_from_slice(&(pc.errors[i] as f32).to_le_bytes());
         }
     }
@@ -809,5 +821,20 @@ mod tests {
         assert!((rx - 1_901_814.123456).abs() < 1e-12);
         assert!((ry - 3_143_265.536789).abs() < 1e-12);
         assert!((rz - 245.52).abs() < 1e-12);
+
+        // Verify true RGB color preservation when PointCloud::colors is attached
+        let mut rgb = ImageRgb::new(2, 1);
+        rgb.set(0, 0, [210, 120, 45]);
+        pc.apply_rgb(&rgb);
+        let path_rgb = std::env::temp_dir().join("rspv_test_bin_f64_rgb.ply");
+        save_point_cloud_ply(&path_rgb, &pc).unwrap();
+        let bytes_rgb = std::fs::read(&path_rgb).unwrap();
+        let _ = std::fs::remove_file(&path_rgb);
+        let pos_rgb = bytes_rgb
+            .windows(end_hdr.len())
+            .position(|w| w == end_hdr)
+            .expect("missing end_header");
+        let payload_rgb = &bytes_rgb[pos_rgb + end_hdr.len()..];
+        assert_eq!(&payload_rgb[24..27], &[210, 120, 45]);
     }
 }

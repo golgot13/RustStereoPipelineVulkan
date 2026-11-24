@@ -610,14 +610,15 @@ pub fn build_epipolar_rectified_cameras(
 }
 
 /// Stream only the minimal source bounding box needed from a 433 Mpx GeoTIFF and bilinearly warp
-/// into the exact epipolar-rectified `out_w x out_h` grid.
+/// into the exact epipolar-rectified `out_w x out_h` grid (optionally preserving true RGB color).
 fn stream_and_rectify_roi(
     reader: &GeoTiffReader,
     full_cam: &PinholeCamera,
     rect_cam: &PinholeCamera,
     out_w: u32,
     out_h: u32,
-) -> Result<(ImageF32, (u32, u32, u32, u32))> {
+    keep_rgb: bool,
+) -> Result<(ImageF32, Option<crate::image::ImageRgb>, (u32, u32, u32, u32))> {
     let fw = reader.meta.width as f64;
     let fh = reader.meta.height as f64;
 
@@ -655,8 +656,13 @@ fn stream_and_rectify_roi(
     let sw = (x1 - x0).max(1);
     let sh = (y1 - y0).max(1);
 
-    let patch = reader.read_roi(x0, y0, sw, sh)?;
+    let (patch, patch_rgb) = if keep_rgb {
+        reader.read_roi_with_rgb(x0, y0, sw, sh)?
+    } else {
+        (reader.read_roi(x0, y0, sw, sh)?, None)
+    };
     let mut out = ImageF32::new(out_w, out_h);
+    let mut out_rgb = patch_rgb.as_ref().map(|_| crate::image::ImageRgb::new(out_w, out_h));
     let w_usize = out_w as usize;
     let h_usize = out_h as usize;
     let n_threads = std::thread::available_parallelism()
@@ -670,42 +676,86 @@ fn stream_and_rectify_roi(
     let pw = patch.width as i32;
     let ph = patch.height as i32;
     let pdata = &patch.data;
+    let prgb_ref = patch_rgb.as_ref();
 
     std::thread::scope(|scope| {
-        for (t, chunk) in out.data.chunks_mut(rows_per * w_usize).enumerate() {
-            let y_start = t * rows_per;
-            scope.spawn(move || {
-                let rows = chunk.len() / w_usize;
-                for ly in 0..rows {
-                    let v = (y_start + ly) as f64;
-                    let row_off = ly * w_usize;
-                    for u_idx in 0..w_usize {
-                        let ray = rect_cam.pixel_to_vector(Vec2::new(u_idx as f64, v));
-                        let src = full_cam.point_to_pixel(rect_cam.center + ray * 1000.0);
-                        let lx = src.x - x0_f;
-                        let ly_s = src.y - y0_f;
-                        if lx >= 0.0 && ly_s >= 0.0 && lx < (pw - 1) as f64 && ly_s < (ph - 1) as f64 {
-                            let ix = lx.floor() as i32;
-                            let iy = ly_s.floor() as i32;
-                            let fx = (lx - ix as f64) as f32;
-                            let fy = (ly_s - iy as f64) as f32;
-                            let i00 = (iy * pw + ix) as usize;
-                            let i10 = i00 + 1;
-                            let i01 = i00 + pw as usize;
-                            let i11 = i01 + 1;
-                            let top = pdata[i00] * (1.0 - fx) + pdata[i10] * fx;
-                            let bot = pdata[i01] * (1.0 - fx) + pdata[i11] * fx;
-                            chunk[row_off + u_idx] = top * (1.0 - fy) + bot * fy;
-                        } else {
-                            chunk[row_off + u_idx] = 0.0;
+        if let Some(ref mut dst_rgb) = out_rgb {
+            for (t, (chunk, rgb_chunk)) in out
+                .data
+                .chunks_mut(rows_per * w_usize)
+                .zip(dst_rgb.data.chunks_mut(rows_per * w_usize))
+                .enumerate()
+            {
+                let y_start = t * rows_per;
+                scope.spawn(move || {
+                    let rows = chunk.len() / w_usize;
+                    for ly in 0..rows {
+                        let v = (y_start + ly) as f64;
+                        let row_off = ly * w_usize;
+                        for u_idx in 0..w_usize {
+                            let ray = rect_cam.pixel_to_vector(Vec2::new(u_idx as f64, v));
+                            let src = full_cam.point_to_pixel(rect_cam.center + ray * 1000.0);
+                            let lx = src.x - x0_f;
+                            let ly_s = src.y - y0_f;
+                            if lx >= 0.0 && ly_s >= 0.0 && lx < (pw - 1) as f64 && ly_s < (ph - 1) as f64 {
+                                let ix = lx.floor() as i32;
+                                let iy = ly_s.floor() as i32;
+                                let fx = (lx - ix as f64) as f32;
+                                let fy = (ly_s - iy as f64) as f32;
+                                let i00 = (iy * pw + ix) as usize;
+                                let i10 = i00 + 1;
+                                let i01 = i00 + pw as usize;
+                                let i11 = i01 + 1;
+                                let top = pdata[i00] * (1.0 - fx) + pdata[i10] * fx;
+                                let bot = pdata[i01] * (1.0 - fx) + pdata[i11] * fx;
+                                chunk[row_off + u_idx] = top * (1.0 - fy) + bot * fy;
+                                if let Some(pr) = prgb_ref {
+                                    rgb_chunk[row_off + u_idx] = pr.sample_bilinear_clamped(lx, ly_s);
+                                }
+                            } else {
+                                chunk[row_off + u_idx] = 0.0;
+                                rgb_chunk[row_off + u_idx] = [0, 0, 0];
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
+        } else {
+            for (t, chunk) in out.data.chunks_mut(rows_per * w_usize).enumerate() {
+                let y_start = t * rows_per;
+                scope.spawn(move || {
+                    let rows = chunk.len() / w_usize;
+                    for ly in 0..rows {
+                        let v = (y_start + ly) as f64;
+                        let row_off = ly * w_usize;
+                        for u_idx in 0..w_usize {
+                            let ray = rect_cam.pixel_to_vector(Vec2::new(u_idx as f64, v));
+                            let src = full_cam.point_to_pixel(rect_cam.center + ray * 1000.0);
+                            let lx = src.x - x0_f;
+                            let ly_s = src.y - y0_f;
+                            if lx >= 0.0 && ly_s >= 0.0 && lx < (pw - 1) as f64 && ly_s < (ph - 1) as f64 {
+                                let ix = lx.floor() as i32;
+                                let iy = ly_s.floor() as i32;
+                                let fx = (lx - ix as f64) as f32;
+                                let fy = (ly_s - iy as f64) as f32;
+                                let i00 = (iy * pw + ix) as usize;
+                                let i10 = i00 + 1;
+                                let i01 = i00 + pw as usize;
+                                let i11 = i01 + 1;
+                                let top = pdata[i00] * (1.0 - fx) + pdata[i10] * fx;
+                                let bot = pdata[i01] * (1.0 - fx) + pdata[i11] * fx;
+                                chunk[row_off + u_idx] = top * (1.0 - fy) + bot * fy;
+                            } else {
+                                chunk[row_off + u_idx] = 0.0;
+                            }
+                        }
+                    }
+                });
+            }
         }
     });
 
-    Ok((out, (x0, y0, sw, sh)))
+    Ok((out, out_rgb, (x0, y0, sw, sh)))
 }
 
 /// Fast (~3 ms) 4x-downsampled 1D horizontal NCC sweep to lock the rectified epipolar search box
@@ -790,6 +840,7 @@ fn estimate_coarse_epipolar_shift(left: &ImageF32, right: &ImageF32, max_shift_p
 
 pub struct PreparedStereoRoi {
     pub left_img: ImageF32,
+    pub left_rgb: Option<crate::image::ImageRgb>,
     pub right_img: ImageF32,
     pub left_cam: AnyCamera,
     pub right_cam: AnyCamera,
@@ -867,8 +918,10 @@ pub fn prepare_stereo_pair_roi_opts(
         build_epipolar_rectified_cameras(&full_cam_l, &full_cam_r, ground_anchor, eff_w, eff_h);
 
     // Stream ONLY the intersecting source tiles/strips from disk & warp to epipolar grid
-    let (left_img, left_roi) = stream_and_rectify_roi(&reader_l, &full_cam_l, &rect_cam_l, eff_w, eff_h)?;
-    let (right_img, right_roi) = stream_and_rectify_roi(&reader_r, &full_cam_r, &rect_cam_r, eff_w, eff_h)?;
+    let (left_img, left_rgb, left_roi) =
+        stream_and_rectify_roi(&reader_l, &full_cam_l, &rect_cam_l, eff_w, eff_h, true)?;
+    let (right_img, _, right_roi) =
+        stream_and_rectify_roi(&reader_r, &full_cam_r, &rect_cam_r, eff_w, eff_h, false)?;
 
     // Lock coarse horizontal disparity shift onto actual terrain elevation in ~3 ms
     let coarse_dx = estimate_coarse_epipolar_shift(&left_img, &right_img, 240);
@@ -887,6 +940,7 @@ pub fn prepare_stereo_pair_roi_opts(
 
     Ok(PreparedStereoRoi {
         left_img,
+        left_rgb,
         right_img,
         left_cam: AnyCamera::Pinhole(rect_cam_l),
         right_cam: AnyCamera::Pinhole(rect_cam_r),
