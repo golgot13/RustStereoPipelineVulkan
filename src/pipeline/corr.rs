@@ -95,6 +95,7 @@ fn compute_census_5x5(img: &ImageF32) -> Vec<u32> {
 }
 
 /// Compute patch matching cost at `(x, y)` in left vs `(x + dx, y + dy)` in right.
+/// Automatically uses runtime-detected AVX2 SIMD for interior rows with safe scalar fallback.
 #[inline]
 pub fn patch_cost(
     left: &ImageF32,
@@ -109,6 +110,13 @@ pub fn patch_cost(
 ) -> f32 {
     let w = left.width as i32;
     let h = left.height as i32;
+    let lx0 = x - hkw;
+    let lx1 = x + hkw;
+    let rx0 = lx0 + dx;
+    let rx1 = lx1 + dx;
+    let interior_x = lx0 >= 0 && lx1 < w && rx0 >= 0 && rx1 < w;
+    let row_len = (2 * hkw + 1) as usize;
+
     match mode {
         CostMode::Sad => {
             let mut sum = 0.0f32;
@@ -118,11 +126,19 @@ pub fn patch_cost(
                 let ry = (y + ky + dy).clamp(0, h - 1) as usize;
                 let lrow = &left.data[ly * w as usize..(ly + 1) * w as usize];
                 let rrow = &right.data[ry * w as usize..(ry + 1) * w as usize];
-                for kx in -hkw..=hkw {
-                    let lx = (x + kx).clamp(0, w - 1) as usize;
-                    let rx = (x + kx + dx).clamp(0, w - 1) as usize;
-                    sum += (lrow[lx] - rrow[rx]).abs();
-                    cnt += 1.0;
+                if interior_x {
+                    sum += crate::pipeline::simd::row_sad(
+                        &lrow[lx0 as usize..lx0 as usize + row_len],
+                        &rrow[rx0 as usize..rx0 as usize + row_len],
+                    );
+                    cnt += row_len as f32;
+                } else {
+                    for kx in -hkw..=hkw {
+                        let lx = (x + kx).clamp(0, w - 1) as usize;
+                        let rx = (x + kx + dx).clamp(0, w - 1) as usize;
+                        sum += (lrow[lx] - rrow[rx]).abs();
+                        cnt += 1.0;
+                    }
                 }
             }
             sum / cnt.max(1.0)
@@ -135,12 +151,20 @@ pub fn patch_cost(
                 let ry = (y + ky + dy).clamp(0, h - 1) as usize;
                 let lrow = &left.data[ly * w as usize..(ly + 1) * w as usize];
                 let rrow = &right.data[ry * w as usize..(ry + 1) * w as usize];
-                for kx in -hkw..=hkw {
-                    let lx = (x + kx).clamp(0, w - 1) as usize;
-                    let rx = (x + kx + dx).clamp(0, w - 1) as usize;
-                    let d = lrow[lx] - rrow[rx];
-                    sum += d * d;
-                    cnt += 1.0;
+                if interior_x {
+                    sum += crate::pipeline::simd::row_ssd(
+                        &lrow[lx0 as usize..lx0 as usize + row_len],
+                        &rrow[rx0 as usize..rx0 as usize + row_len],
+                    );
+                    cnt += row_len as f32;
+                } else {
+                    for kx in -hkw..=hkw {
+                        let lx = (x + kx).clamp(0, w - 1) as usize;
+                        let rx = (x + kx + dx).clamp(0, w - 1) as usize;
+                        let d = lrow[lx] - rrow[rx];
+                        sum += d * d;
+                        cnt += 1.0;
+                    }
                 }
             }
             sum / cnt.max(1.0)
@@ -158,17 +182,30 @@ pub fn patch_cost(
                 let ry = (y + ky + dy).clamp(0, h - 1) as usize;
                 let lrow = &left.data[ly * w as usize..(ly + 1) * w as usize];
                 let rrow = &right.data[ry * w as usize..(ry + 1) * w as usize];
-                for kx in -hkw..=hkw {
-                    let lx = (x + kx).clamp(0, w - 1) as usize;
-                    let rx = (x + kx + dx).clamp(0, w - 1) as usize;
-                    let lv = lrow[lx];
-                    let rv = rrow[rx];
-                    sum_l += lv;
-                    sum_r += rv;
-                    sum_ll += lv * lv;
-                    sum_rr += rv * rv;
-                    sum_lr += lv * rv;
-                    cnt += 1.0;
+                if interior_x {
+                    let (sl, sr, sll, srr, slr) = crate::pipeline::simd::row_ncc_moments(
+                        &lrow[lx0 as usize..lx0 as usize + row_len],
+                        &rrow[rx0 as usize..rx0 as usize + row_len],
+                    );
+                    sum_l += sl;
+                    sum_r += sr;
+                    sum_ll += sll;
+                    sum_rr += srr;
+                    sum_lr += slr;
+                    cnt += row_len as f32;
+                } else {
+                    for kx in -hkw..=hkw {
+                        let lx = (x + kx).clamp(0, w - 1) as usize;
+                        let rx = (x + kx + dx).clamp(0, w - 1) as usize;
+                        let lv = lrow[lx];
+                        let rv = rrow[rx];
+                        sum_l += lv;
+                        sum_r += rv;
+                        sum_ll += lv * lv;
+                        sum_rr += rv * rv;
+                        sum_lr += lv * rv;
+                        cnt += 1.0;
+                    }
                 }
             }
             let inv_n = 1.0 / cnt.max(1.0);

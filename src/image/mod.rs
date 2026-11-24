@@ -24,12 +24,46 @@ impl ImageF32 {
     }
 
     pub fn from_vec(width: u32, height: u32, data: Vec<f32>) -> Self {
-        assert_eq!(data.len(), (width as usize) * (height as usize));
-        Self {
-            width,
-            height,
-            data,
-            nodata: None,
+        let expected = (width as usize).saturating_mul(height as usize);
+        if data.len() == expected {
+            Self {
+                width,
+                height,
+                data,
+                nodata: None,
+            }
+        } else {
+            let mut safe = data;
+            safe.resize(expected, 0.0);
+            Self {
+                width,
+                height,
+                data: safe,
+                nodata: None,
+            }
+        }
+    }
+
+    pub fn try_from_vec(width: u32, height: u32, data: Vec<f32>) -> Option<Self> {
+        let expected = (width as usize).checked_mul(height as usize)?;
+        if data.len() == expected {
+            Some(Self {
+                width,
+                height,
+                data,
+                nodata: None,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn get_checked(&self, x: u32, y: u32) -> Option<f32> {
+        if x < self.width && y < self.height {
+            self.data.get((y as usize) * (self.width as usize) + (x as usize)).copied()
+        } else {
+            None
         }
     }
 

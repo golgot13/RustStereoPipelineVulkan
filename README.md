@@ -1,72 +1,73 @@
-# RustStereoPipelineVulkan
+# RustStereoPipelineVulkan v0.2.0
 
-Réécriture complète en **Rust pur (0 crate externe)** et optimisée **Vulkan Compute** du pipeline de stéréophotogrammétrie inspiré de **NASA Ames Stereo Pipeline (ASP)**, dotée d'une **interface graphique hybride (X11 natif + Web UI embarquée)** et d'un **CLI complet**.
+Plateforme de stéréophotogrammétrie modulaire, scriptable et légère inspirée de **NASA Ames Stereo Pipeline (ASP)** et **AEROPHOTOGRAM**, développée en **Rust** avec moteur **Vulkan Compute** (SPIR-V 1.0 généré en pur Rust), **CPU SIMD AVX2 sécurisé**, **CLI scriptable**, **Studio Desktop `egui`**, **X11 natif** et **Web UI SSE**.
+
+> **Légèreté préservée** : le cœur complet (Vulkan Compute, SPIR-V, DAG/Checkpoints, JSON, géodésie `f64`, tuilage 1:1, CLI, X11 natif et Web UI SSE) compile avec **0 crate externe** via `--no-default-features`. Seule la feature optionnelle `egui-ui` (activée par défaut) ajoute `eframe`.
 
 ## Points forts techniques
 
-- **Zéro dépendance externe (`[dependencies]` vide)** : utilise exclusivement la bibliothèque standard Rust (`std`) + FFI dynamique (`dlopen`/`dlsym`) vers `libvulkan.so.1` et `libX11.so.6`.
-- **Moteur Vulkan 1.0 Compute + Assembleur SPIR-V 1.0 pur Rust** (`src/vulkan/`):
-  - Charge dynamiquement `libvulkan.so.1` / `libvulkan.1.dylib` sans dépendance au SDK Vulkan à la compilation.
-  - Génère et valide à la volée de véritables shaders compute **SPIR-V 1.0** (`prefilter`, `stereo_bm` SAD/SSD/NCC, `subpixel_parabola`, `dem_hillshade`) sans `glslc`/`shaderc`.
-  - Bascule automatiquement sur un moteur **CPU multi-thread** (`std::thread::scope`) lorsqu'aucun pilote/GPU Vulkan n'est disponible.
-- **Pipeline Stéréo ASP complet en 5 étapes + DEM + ICP** (`src/pipeline/`):
-  - `Stage 0 — stereo_pprc` : normalisation d'intensité, *Subtracted Mean* (Vulkan GPU / image intégrale $O(1)$), *Laplacian of Gaussian* (LoG).
-  - `Stage 1 — stereo_corr` : corrélation stéréo **ASP BM**, **ASP SGM** (programmation dynamique multi-chemins) et **ASP MGM** (agrégation par quadrants), métriques **SAD / SSD / NCC / Census 5×5** + vérification gauche-droite (LR check).
-  - `Stage 2 — stereo_rfne` : raffinement subpixel **Parabola**, **Affine Lucas-Kanade** et **Bayes-EM pondéré**.
-  - `Stage 3 — stereo_fltr` : érosion des valeurs aberrantes (`rm-half-kernel`, `rm-threshold`, `rm-min-matches`, `max-mean-diff`), filtre médian et comblement des trous.
-  - `Stage 4 — stereo_tri` : triangulation 3D rayon-rayon (modèles caméras **Pinhole `.tsai`** avec distorsion Brown-Conrady et **RPC `.rpb`** satellitaire) + export **PLY / XYZ**.
-  - `point2dem` & `pc_align` : génération de **DEM GeoTIFF**, ombrage lambertien (*hillshade* Vulkan/CPU) et recalage 3D **ICP Kabsch SVD**.
-- **I/O scientifique sans crate** (`src/image/io.rs`) : lecture/écriture **TIFF/GeoTIFF** (8/16/32f + tags géospatiaux), **PFM**, **PGM/PPM**, **BMP**, encodeur **PNG** pur Rust, **PLY**, **XYZ/CSV**.
-- **Interface Graphique Multi-Backend** (`src/ui/`):
-  - **Studio Desktop `egui` / `eframe`** (`src/ui/egui_app.rs`, activé par défaut via la feature `egui-ui`) : exécution asynchrone en arrière-plan avec barre de progression, inspecteur complet des 5 étapes ASP, 9 calques + mode **Split View**, inspecteur de pixel au survol, ombrage *hillshade* en temps réel, vue **3D DEM interactive**, télémétrie et shaders SPIR-V.
-  - **Fenêtre native X11** (`libX11.so.6` via `dlopen`, **0 crate externe**) : moteur de rendu logiciel BGRA32 + vue 3D DEM.
-  - **Web UI embarquée** (`std::net::TcpListener`, **0 crate externe**) : SPA HTML5/Canvas/3D DEM accessible partout (headless/SSH).
+- **Contrat unique `JobSpec` & Parité 100 % CLI ↔ Desktop `egui` ↔ X11 ↔ Web UI** (`src/core/job.rs`, `src/core/json.rs`) :
+  - Sérialisation/désérialisation JSON sans crate (`--job mission.json`, `stdin` via `--job -`, `--export-job`, `batch`).
+  - Génération de la commande CLI exacte depuis `egui` et la Web UI (*Copy CLI Cmd* / *Download job.json*).
+  - Flux d'événements machine-readable **`--ndjson`** en CLI et **Server-Sent Events (`GET /api/events`)** en Web UI.
+- **Robustesse Industrielle (« 0 Panic »)** (`src/core/error.rs`, `src/core/cancel.rs`, `src/core/hardware.rs`) :
+  - Codes de retour POSIX normalisés (`0`, `2` CLI/Config, `3` I/O, `4` Compute/RAM, `5` Géométrie, `130` Annulé).
+  - `PreflightValidator` (vérification dimensions, dynamique, baseline/convergence caméras, budget RAM).
+  - `CancellationToken` coopératif (bouton *Stop* en `egui`, `POST /api/cancel` en Web UI).
+  - `HardwareProfile` auto-détecté (`compact` / `standard` / `workstation`) pour Linux et Windows.
+- **Moteur DAG Modulaire, Tuilage Full-Scale 1:1 & Checkpoints** (`src/pipeline/dag.rs`, `src/pipeline/tiling.rs`) :
+  - Exécution sélective (`--from-stage`, `--to-stage`), reprise sur incident (`--resume` via `00_checkpoints/`), rapport qualité automatique (`-quality_report.json` & `.txt`).
+  - Découpage transparent en **tuiles 1:1 avec halo** (sans décimation destructive) pour traiter de grands capteurs en RAM bornée.
+- **Performance Vulkan Compute + CPU AVX2** (`src/vulkan/`, `src/pipeline/simd.rs`) :
+  - Chargeur dynamique multiplateforme (`vulkan-1.dll` Windows / `libvulkan.so.1` Linux / `libvulkan.1.dylib` macOS).
+  - **Cache persistant de pipelines SPIR-V 1.0** (5 shaders compute validés : `prefilter_box_submean`, `prefilter_log_2d`, `stereo_bm_sad_ssd_ncc`, `subpixel_parabola`, `dem_hillshade`).
+  - Noyaux CPU **AVX2** détectés dynamiquement (`is_x86_feature_detected!("avx2")`) avec fallback scalaire sûr (zéro `SIGILL`).
+- **Géodésie Double Précision `f64`** (`src/core/crs.rs`) :
+  - Reprojection bidirectionnelle `WGS84 (EPSG:4326)`, `ECEF (EPSG:4978)`, **Lambert-93 (`EPSG:2154`)**, **UTM (`EPSG:326xx/327xx`)**, `Moon`, `Mars`, `Local`.
 
 ## Compilation
 
 ```bash
-# Avec l'interface graphique egui (par défaut)
+# Avec le Studio Desktop egui (par défaut)
 cargo build --release
 cargo test
 
-# Mode 100 % zéro dépendance externe (CLI + Vulkan Compute + X11 natif + Web UI)
+# Mode 100 % zéro dépendance externe (CLI + Vulkan Compute + X11 natif + Web UI SSE)
 cargo build --release --no-default-features
 cargo test --no-default-features
 ```
 
-## Utilisation CLI
+## Utilisation CLI & Scriptabilité
 
 ```bash
-# Diagnostic Vulkan Compute & validation des shaders SPIR-V 1.0
+# Diagnostic HardwareProfile, AVX2, Vulkan Compute & validation des 5 shaders SPIR-V 1.0
 cargo run --release -- vulkan-info
 
-# Génération d'un terrain planétaire synthétique + pipeline complet + évaluation RMSE
-cargo run --release -- synthetic output/demo --width 192 --height 144 --stereo-algorithm asp_sgm
+# Terrain synthétique + tuilage 1:1 + rapport qualité + flux NDJSON + export du JobSpec
+cargo run --release -- synthetic output/demo --width 192 --height 144 \
+  --stereo-algorithm asp_mgm --tile-size 128 --export-job output/demo_job.json --ndjson
 
-# Pipeline complet sur vos images et caméras (.tsai ou .rpb)
-cargo run --release -- stereo left.tif right.tif left.tsai right.tsai output/run \
-  -s stereo.default.example --stereo-algorithm asp_sgm --subpixel-mode 2 --backend auto
+# Exécution d'un JobSpec JSON (fichier ou stdin) avec reprise sur checkpoints
+cargo run --release -- run --job output/demo_job.json --resume --ndjson
+cat output/demo_job.json | cargo run --release -- run --job - --ndjson
 
-# Recalage 3D ICP de deux nuages de points
-cargo run --release -- pc_align ref.xyz src.xyz --max-iters 40
+# Traitement par lots (batch) d'un dossier de manifests JSON
+cargo run --release -- batch output/jobs/ --continue-on-error --ndjson
 
-# Conversion nuage de points -> DEM GeoTIFF + Hillshade
-cargo run --release -- point2dem cloud.xyz output/dem_out
-
-# Prévisualisation colorisée PNG d'une disparité ou d'un DEM
-cargo run --release -- disparitydebug output/demo-DEM.tif output/preview --cmap turbo
+# Reprojection géodésique f64 (ex. WGS84 -> Lambert-93 EPSG:2154)
+cargo run --release -- list-crs
+cargo run --release -- crs-convert --src EPSG:4326 --dst EPSG:2154 --x 2.3499 --y 48.8530 --z 35.0
 ```
 
-## Utilisation Interface Graphique (GUI)
+## Interfaces Graphiques (Desktop & Web)
 
 ```bash
-# Lancer directement le studio desktop egui
+# Studio Desktop egui (recommandé sur Windows / Linux / macOS)
 cargo run --release -- egui
 
-# Mode hybride auto (egui si un écran est présent, sinon X11 natif, sinon Web UI)
+# Lanceur hybride auto (egui -> X11 natif -> Web UI)
 cargo run --release -- gui
 
-# Forcer la fenêtre native X11 (0 crate) ou la Web UI embarquée
-cargo run --release -- gui --x11
+# Web UI embarquée HTTP/1.1 + SSE temps réel (0 crate externe)
 cargo run --release -- web-ui --port 8080
 ```

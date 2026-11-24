@@ -3,11 +3,14 @@
 
 pub mod align;
 pub mod corr;
+pub mod dag;
 pub mod dem;
 pub mod fltr;
 pub mod pprc;
 pub mod rfne;
+pub mod simd;
 pub mod synthetic;
+pub mod tiling;
 pub mod tri;
 
 use std::io;

@@ -501,10 +501,82 @@ pub fn build_hillshade_shader() -> Vec<u32> {
     b.finish()
 }
 
+/// 5. 2D Discrete Laplacian of Gaussian (LoG) Prefilter Compute Shader.
+/// Computes smoothed 3x3 Gaussian + discrete Laplacian `4*C - L - R - U - D` in a single GPU pass.
+/// Bindings:
+///   0: `in_img[]` (f32)
+///   1: `out_img[]` (f32)
+///   2: `params[]` (i32): `[width, height]`
+pub fn build_log_2d_shader() -> Vec<u32> {
+    let mut b = SpirvBuilder::new(16, 16, 1);
+    let buf_in = b.add_storage_buffer_f32(0);
+    let buf_out = b.add_storage_buffer_f32(1);
+    let buf_p = b.add_storage_buffer_i32(2);
+
+    let c0 = b.const_i32(0);
+    let c1 = b.const_i32(1);
+    let f4 = b.const_f32(4.0);
+
+    b.begin_main();
+    let (gx, gy) = b.load_global_xy();
+    let w = b.load_buf_i32(buf_p, c0, c0);
+    let h = b.load_buf_i32(buf_p, c0, c1);
+
+    let oob_x = b.binop(OP_SGREATER_THAN_EQUAL, b.ty_bool, gx, w);
+    let oob_y = b.binop(OP_SGREATER_THAN_EQUAL, b.ty_bool, gy, h);
+    let oob = b.binop(OP_LOGICAL_OR, b.ty_bool, oob_x, oob_y);
+    let lbl_ret = b.id();
+    let lbl_body = b.id();
+    b.selection_merge(lbl_body);
+    b.branch_cond(oob, lbl_ret, lbl_body);
+    b.label(lbl_ret);
+    b.return_void();
+
+    b.label(lbl_body);
+    let wm1 = b.binop(OP_ISUB, b.ty_i32, w, c1);
+    let hm1 = b.binop(OP_ISUB, b.ty_i32, h, c1);
+    let xm1 = b.binop(OP_ISUB, b.ty_i32, gx, c1);
+    let xp1 = b.binop(OP_IADD, b.ty_i32, gx, c1);
+    let ym1 = b.binop(OP_ISUB, b.ty_i32, gy, c1);
+    let yp1 = b.binop(OP_IADD, b.ty_i32, gy, c1);
+
+    let xl = b.glsl3(GLSL_SCLAMP, b.ty_i32, xm1, c0, wm1);
+    let xr = b.glsl3(GLSL_SCLAMP, b.ty_i32, xp1, c0, wm1);
+    let yu = b.glsl3(GLSL_SCLAMP, b.ty_i32, ym1, c0, hm1);
+    let yd = b.glsl3(GLSL_SCLAMP, b.ty_i32, yp1, c0, hm1);
+
+    let row_c = b.binop(OP_IMUL, b.ty_i32, gy, w);
+    let row_u = b.binop(OP_IMUL, b.ty_i32, yu, w);
+    let row_d = b.binop(OP_IMUL, b.ty_i32, yd, w);
+
+    let ic = b.binop(OP_IADD, b.ty_i32, row_c, gx);
+    let il = b.binop(OP_IADD, b.ty_i32, row_c, xl);
+    let ir = b.binop(OP_IADD, b.ty_i32, row_c, xr);
+    let iu = b.binop(OP_IADD, b.ty_i32, row_u, gx);
+    let id = b.binop(OP_IADD, b.ty_i32, row_d, gx);
+
+    let vc = b.load_buf_f32(buf_in, c0, ic);
+    let vl = b.load_buf_f32(buf_in, c0, il);
+    let vr = b.load_buf_f32(buf_in, c0, ir);
+    let vu = b.load_buf_f32(buf_in, c0, iu);
+    let vd = b.load_buf_f32(buf_in, c0, id);
+
+    let c4 = b.binop(OP_FMUL, b.ty_f32, f4, vc);
+    let s1 = b.binop(OP_FSUB, b.ty_f32, c4, vl);
+    let s2 = b.binop(OP_FSUB, b.ty_f32, s1, vr);
+    let s3 = b.binop(OP_FSUB, b.ty_f32, s2, vu);
+    let lap = b.binop(OP_FSUB, b.ty_f32, s3, vd);
+    b.store_buf_f32(buf_out, c0, ic, lap);
+
+    b.end_main();
+    b.finish()
+}
+
 /// Summary info for all built-in SPIR-V shaders.
 pub fn shader_catalog() -> Vec<(&'static str, Vec<u32>)> {
     vec![
         ("prefilter_box_submean", build_prefilter_shader()),
+        ("prefilter_log_2d", build_log_2d_shader()),
         ("stereo_bm_sad_ssd_ncc", build_stereo_bm_shader()),
         ("subpixel_parabola", build_subpixel_parabola_shader()),
         ("dem_hillshade", build_hillshade_shader()),

@@ -1,6 +1,6 @@
 [package]
 name = "rust-stereo-pipeline-vulkan"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Rust + Vulkan Compute recode of the Ames Stereo Pipeline with CLI, egui Studio, Native X11, and Web UI"
 license = "Apache-2.0"

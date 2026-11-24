@@ -1,10 +1,10 @@
 //! Full interactive `egui` / `eframe` Desktop Workstation for RustStereoPipelineVulkan.
+//! 100% parity with CLI & Web UI via unified `JobSpec`, `WorkflowExecutor`, and `CancellationToken`.
 //! Features:
-//! - Background async 5-stage stereo pipeline execution with live progress bar
-//! - Complete ASP parameter inspector (pprc, corr BM/SGM/MGM, rfne, fltr, tri, DEM/hillshade)
-//! - 9-layer GPU-textured viewer with smooth zoom/pan, pixel inspector, colormaps & colorbar
-//! - Side-by-side comparison mode & interactive 3D orbitable DEM mesh viewer
-//! - Live stage timing bars, Vulkan/SPIR-V telemetry, and one-click GeoTIFF/PLY/PNG export
+//! - Background async 5-stage DAG execution with live progress bar + cooperative Stop/Cancel
+//! - Complete ASP parameter inspector (pprc, corr BM/SGM/MGM, rfne, fltr, tri, DEM/hillshade, Tile 1:1, CRS)
+//! - Scriptability controls: Copy exact CLI command, Export/Load `job.json`, Export GeoTIFF/PLY/Quality Report
+//! - 9-layer GPU-textured viewer with smooth zoom/pan, Split View, pixel inspector, colormaps & 3D DEM
 
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
@@ -16,8 +16,13 @@ use crate::camera::{load_camera, AnyCamera};
 use crate::config::{
     ComputeBackendPreference, CostMode, PrefilterMode, StereoAlgorithm, StereoSettings, SubpixelMode,
 };
+use crate::core::cancel::CancellationToken;
+use crate::core::crs::CrsId;
+use crate::core::hardware::HardwareProfile;
+use crate::core::job::{JobInput, JobSpec};
 use crate::image::io::load_image;
 use crate::image::{Colormap, ImageF32};
+use crate::pipeline::dag::{QualityReport, WorkflowEvent, WorkflowExecutor};
 use crate::pipeline::{dem, synthetic, PipelineResult, StereoPipelineEngine};
 use crate::vulkan::shaders::shader_catalog;
 use crate::vulkan::spirv::validate_spirv;
@@ -62,24 +67,27 @@ impl Layer {
 
 enum WorkerMsg {
     Progress(String, f32),
-    Finished(Box<PipelineResult>),
+    Finished(Box<PipelineResult>, Box<QualityReport>),
+    Failed(String),
 }
 
 struct StereoEguiApp {
     engine: Arc<StereoPipelineEngine>,
+    hw: HardwareProfile,
     left: ImageF32,
     right: ImageF32,
     cam_left: AnyCamera,
     cam_right: AnyCamera,
-    settings: StereoSettings,
+    job: JobSpec,
     result: PipelineResult,
+    report: Option<QualityReport>,
 
     // File path inputs
     left_path: String,
     right_path: String,
     cam_left_path: String,
     cam_right_path: String,
-    out_prefix: String,
+    job_file_path: String,
     synth_size_idx: usize,
 
     // View state
@@ -98,7 +106,8 @@ struct StereoEguiApp {
     tex_left: Option<TextureHandle>,
     tex_dirty: bool,
 
-    // Async worker state
+    // Async worker & cancellation state
+    cancel: CancellationToken,
     worker_rx: Option<Receiver<WorkerMsg>>,
     progress_frac: f32,
     progress_text: String,
@@ -117,8 +126,45 @@ impl StereoEguiApp {
     ) -> Self {
         apply_dark_scientific_theme(&cc.egui_ctx);
 
+        let hw = HardwareProfile::detect();
         let engine = Arc::new(StereoPipelineEngine::new(settings.backend));
-        let result = engine.run_full(&left, &right, &cam_left, &cam_right, &settings, |_, _| {});
+        let mut job = JobSpec::default();
+        job.input = JobInput::Synthetic {
+            width: left.width,
+            height: left.height,
+        };
+        job.output_prefix = "output/egui_run".to_string();
+        job.tile_size = hw.tile_size;
+        job.write_outputs = false;
+        job.write_checkpoints = false;
+        job.settings = settings;
+
+        let cancel = CancellationToken::new();
+        let init_out = WorkflowExecutor::execute_in_memory(
+            &job,
+            &left,
+            &right,
+            &cam_left,
+            &cam_right,
+            None,
+            &engine,
+            &cancel,
+            |_| {},
+        );
+
+        let (result, report, init_log) = match init_out {
+            Ok(out) => {
+                let msg = format!(
+                    "Initialized ({}x{}, tile {}px) in {:.1} ms — {}",
+                    left.width, left.height, job.tile_size, out.result.timings.total_ms, engine.vulkan_status
+                );
+                (out.result, Some(out.report), msg)
+            }
+            Err(e) => {
+                let fallback = engine.run_full(&left, &right, &cam_left, &cam_right, &job.settings, |_, _| {});
+                (fallback, None, format!("Initial warning: {}", e))
+            }
+        };
 
         let spirv_summary = shader_catalog()
             .into_iter()
@@ -129,24 +175,21 @@ impl StereoEguiApp {
             })
             .collect();
 
-        let init_log = format!(
-            "Initialized ({}x{}) in {:.1} ms — {}",
-            left.width, left.height, result.timings.total_ms, engine.vulkan_status
-        );
-
         Self {
             engine,
+            hw,
             left,
             right,
             cam_left,
             cam_right,
-            settings,
+            job,
             result,
+            report,
             left_path: String::new(),
             right_path: String::new(),
             cam_left_path: String::new(),
             cam_right_path: String::new(),
-            out_prefix: "output/egui_run".to_string(),
+            job_file_path: "output/stereo_job.json".to_string(),
             synth_size_idx: 1,
             active_layer: Layer::Dem,
             colormap: Colormap::Turbo,
@@ -160,6 +203,7 @@ impl StereoEguiApp {
             tex_main: None,
             tex_left: None,
             tex_dirty: true,
+            cancel,
             worker_rx: None,
             progress_frac: 1.0,
             progress_text: "Ready".to_string(),
@@ -183,31 +227,64 @@ impl StereoEguiApp {
         if self.is_running() {
             return;
         }
+        self.cancel.reset();
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
         self.progress_frac = 0.02;
-        self.progress_text = "Starting stereo pipeline...".to_string();
+        self.progress_text = "Starting DAG stereo pipeline...".to_string();
 
         let engine = Arc::clone(&self.engine);
         let left = self.left.clone();
         let right = self.right.clone();
         let cl = self.cam_left.clone();
         let cr = self.cam_right.clone();
-        let cfg = self.settings.clone();
+        let job = self.job.clone();
+        let cancel = self.cancel.clone();
         let repaint_ctx = ctx.clone();
 
         std::thread::spawn(move || {
-            let res = engine.run_full(&left, &right, &cl, &cr, &cfg, |stage, pct| {
-                let _ = tx.send(WorkerMsg::Progress(stage.to_string(), pct));
-                repaint_ctx.request_repaint();
-            });
-            let _ = tx.send(WorkerMsg::Finished(Box::new(res)));
+            let tx_ev = tx.clone();
+            let ctx_ev = repaint_ctx.clone();
+            let outcome = WorkflowExecutor::execute_in_memory(
+                &job,
+                &left,
+                &right,
+                &cl,
+                &cr,
+                None,
+                &engine,
+                &cancel,
+                move |ev| {
+                    match ev {
+                        WorkflowEvent::StageStart { label, pct, .. } => {
+                            let _ = tx_ev.send(WorkerMsg::Progress(label, pct));
+                            ctx_ev.request_repaint();
+                        }
+                        WorkflowEvent::TileProgress { tile, total, pct } if total > 1 => {
+                            let _ = tx_ev.send(WorkerMsg::Progress(
+                                format!("Full-Scale 1:1 Tile {}/{}", tile, total),
+                                pct,
+                            ));
+                            ctx_ev.request_repaint();
+                        }
+                        _ => {}
+                    }
+                },
+            );
+            match outcome {
+                Ok(out) => {
+                    let _ = tx.send(WorkerMsg::Finished(Box::new(out.result), Box::new(out.report)));
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::Failed(e.to_string()));
+                }
+            }
             repaint_ctx.request_repaint();
         });
     }
 
     fn poll_worker(&mut self) {
-        let mut finished: Option<PipelineResult> = None;
+        let mut done: Option<Result<(PipelineResult, QualityReport), String>> = None;
         if let Some(rx) = &self.worker_rx {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
@@ -215,28 +292,41 @@ impl StereoEguiApp {
                         self.progress_text = s;
                         self.progress_frac = p;
                     }
-                    WorkerMsg::Finished(res) => {
-                        finished = Some(*res);
+                    WorkerMsg::Finished(res, rep) => {
+                        done = Some(Ok((*res, *rep)));
+                    }
+                    WorkerMsg::Failed(err) => {
+                        done = Some(Err(err));
                     }
                 }
             }
         }
-        if let Some(res) = finished {
-            let msg = format!(
-                "Completed {}x{} in {:.1} ms (valid {:.1}%, {} pts, err {:.4} m)",
-                res.left_raw.width,
-                res.left_raw.height,
-                res.timings.total_ms,
-                res.disp_filtered.valid_fraction() * 100.0,
-                res.point_cloud.valid_count(),
-                res.point_cloud.mean_error()
-            );
-            self.result = res;
+        if let Some(outcome) = done {
             self.worker_rx = None;
             self.progress_frac = 1.0;
-            self.progress_text = "Ready".to_string();
-            self.tex_dirty = true;
-            self.log(msg);
+            match outcome {
+                Ok((res, rep)) => {
+                    let msg = format!(
+                        "Completed {}x{} ({} tiles) in {:.1} ms (valid {:.1}%, {} pts, err {:.4} m)",
+                        res.left_raw.width,
+                        res.left_raw.height,
+                        rep.tiles_processed,
+                        res.timings.total_ms,
+                        res.disp_filtered.valid_fraction() * 100.0,
+                        res.point_cloud.valid_count(),
+                        res.point_cloud.mean_error()
+                    );
+                    self.result = res;
+                    self.report = Some(rep);
+                    self.progress_text = "Ready".to_string();
+                    self.tex_dirty = true;
+                    self.log(msg);
+                }
+                Err(err) => {
+                    self.progress_text = err.clone();
+                    self.log(format!("Stopped/Error: {}", err));
+                }
+            }
         }
     }
 
@@ -246,8 +336,9 @@ impl StereoEguiApp {
         self.right = ds.right_image;
         self.cam_left = ds.left_cam;
         self.cam_right = ds.right_cam;
-        self.settings.search_min_y = 0;
-        self.settings.search_max_y = 0;
+        self.job.input = JobInput::Synthetic { width: w, height: h };
+        self.job.settings.search_min_y = 0;
+        self.job.settings.search_max_y = 0;
         self.log(format!("Generated synthetic planetary crater pair ({}x{})", w, h));
         self.trigger_pipeline_run(ctx);
     }
@@ -285,20 +376,56 @@ impl StereoEguiApp {
         self.right = r;
         self.cam_left = cl;
         self.cam_right = cr;
+        self.job.input = JobInput::Files {
+            left_image: self.left_path.trim().to_string(),
+            right_image: self.right_path.trim().to_string(),
+            left_camera: self.cam_left_path.trim().to_string(),
+            right_camera: self.cam_right_path.trim().to_string(),
+        };
         self.log("Loaded custom stereo pair & cameras".to_string());
         self.trigger_pipeline_run(ctx);
     }
 
+    fn load_job_file(&mut self, ctx: &egui::Context) {
+        match JobSpec::load_file(Path::new(self.job_file_path.trim())) {
+            Ok(mut spec) => {
+                spec.write_outputs = false;
+                spec.write_checkpoints = false;
+                let inp = spec.input.clone();
+                self.job = spec;
+                match inp {
+                    JobInput::Synthetic { width, height } => {
+                        self.generate_synthetic(width, height, ctx);
+                    }
+                    JobInput::Files {
+                        left_image,
+                        right_image,
+                        left_camera,
+                        right_camera,
+                    } => {
+                        self.left_path = left_image;
+                        self.right_path = right_image;
+                        self.cam_left_path = left_camera;
+                        self.cam_right_path = right_camera;
+                        self.load_from_paths(ctx);
+                    }
+                }
+                self.log(format!("Loaded JobSpec from {}", self.job_file_path));
+            }
+            Err(e) => self.log(format!("Failed loading job.json: {}", e)),
+        }
+    }
+
     fn recompute_hillshade_live(&mut self) {
-        let vk = match self.settings.backend {
+        let vk = match self.job.settings.backend {
             ComputeBackendPreference::Cpu => None,
             _ => self.engine.vulkan.as_ref(),
         };
         let (hs, _) = dem::compute_hillshade(
             &self.result.dem.elevation,
             self.result.dem.pixel_size as f32,
-            self.settings.hillshade_azimuth_deg,
-            self.settings.hillshade_elevation_deg,
+            self.job.settings.hillshade_azimuth_deg,
+            self.job.settings.hillshade_elevation_deg,
             vk,
         );
         self.result.dem.hillshade = hs;
@@ -388,17 +515,41 @@ impl eframe::App for StereoEguiApp {
 
                 let (badge_txt, badge_col) = if self.engine.vulkan.is_some() {
                     ("VULKAN COMPUTE GPU", Color32::from_rgb(46, 204, 113))
+                } else if self.hw.avx2_supported {
+                    ("CPU AVX2 MULTI-THREAD", Color32::from_rgb(245, 176, 65))
                 } else {
-                    ("CPU MULTI-THREAD FALLBACK", Color32::from_rgb(245, 176, 65))
+                    ("CPU MULTI-THREAD", Color32::from_rgb(245, 176, 65))
                 };
                 ui.label(RichText::new(badge_txt).small().strong().color(badge_col));
+                ui.label(
+                    RichText::new(format!(
+                        "[{} | RAM {}MB | Tile {}px]",
+                        self.hw.tier.name(),
+                        self.hw.ram_budget_mb,
+                        self.job.tile_size
+                    ))
+                    .small()
+                    .weak(),
+                );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Export GeoTIFF / PLY").clicked() {
-                        match StereoPipelineEngine::save_outputs(Path::new(&self.out_prefix), &self.result) {
-                            Ok(_) => self.log(format!("Exported outputs to {}-*.tif / -PC.ply", self.out_prefix)),
+                    if ui.button("Export All + Report").clicked() {
+                        let out_p = Path::new(&self.job.output_prefix);
+                        match StereoPipelineEngine::save_outputs(out_p, &self.result) {
+                            Ok(_) => {
+                                if let Some(ref rep) = self.report {
+                                    let _ = rep.save(out_p);
+                                }
+                                let _ = self.job.save_file(Path::new(&format!("{}-job.json", self.job.output_prefix)));
+                                self.log(format!("Exported GeoTIFF/PLY/Report/job.json to {}*", self.job.output_prefix));
+                            }
                             Err(e) => self.log(format!("Export error: {}", e)),
                         }
+                    }
+                    if ui.button("Copy CLI Cmd").clicked() {
+                        let cmd = self.job.to_cli_command();
+                        ctx.copy_text(cmd);
+                        self.log("Copied exact reproducible CLI command to clipboard".to_string());
                     }
                     if ui.button("Reset View").clicked() {
                         self.zoom = 1.0;
@@ -407,14 +558,25 @@ impl eframe::App for StereoEguiApp {
                         self.pitch = 0.55;
                     }
                     ui.checkbox(&mut self.split_view, "Split View");
-                    let run_btn = egui::Button::new(
-                        RichText::new(if self.is_running() { "Running..." } else { "Run Pipeline [R]" })
-                            .strong()
-                            .color(Color32::from_rgb(10, 16, 24)),
-                    )
-                    .fill(Color32::from_rgb(56, 152, 255));
-                    if ui.add_enabled(!self.is_running(), run_btn).clicked() {
-                        self.trigger_pipeline_run(ctx);
+                    if self.is_running() {
+                        let stop_btn = egui::Button::new(
+                            RichText::new("Stop").strong().color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(192, 57, 43));
+                        if ui.add(stop_btn).clicked() {
+                            self.cancel.cancel();
+                            self.log("Cancellation requested by user".to_string());
+                        }
+                    } else {
+                        let run_btn = egui::Button::new(
+                            RichText::new("Run Pipeline [R]")
+                                .strong()
+                                .color(Color32::from_rgb(10, 16, 24)),
+                        )
+                        .fill(Color32::from_rgb(56, 152, 255));
+                        if ui.add(run_btn).clicked() {
+                            self.trigger_pipeline_run(ctx);
+                        }
                     }
                 });
             });
@@ -427,7 +589,7 @@ impl eframe::App for StereoEguiApp {
                 if self.is_running() {
                     ui.add(
                         egui::ProgressBar::new(self.progress_frac)
-                            .desired_width(220.0)
+                            .desired_width(240.0)
                             .text(&self.progress_text),
                     );
                 } else {
@@ -436,9 +598,9 @@ impl eframe::App for StereoEguiApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(format!(
-                            "Zoom: {:.0}% | {} | Keys: 1-9 Layers, R Run, C Colormap",
+                            "Zoom: {:.0}% | CRS: {} | Keys: 1-9 Layers, R Run, C Colormap",
                             self.zoom * 100.0,
-                            self.result.timings.active_backend
+                            self.job.crs.code()
                         ))
                         .small()
                         .weak(),
@@ -449,7 +611,7 @@ impl eframe::App for StereoEguiApp {
 
         // Left Parameter Inspector
         egui::SidePanel::left("controls_panel")
-            .default_width(295.0)
+            .default_width(305.0)
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -500,26 +662,49 @@ impl eframe::App for StereoEguiApp {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Out  ");
-                                ui.text_edit_singleline(&mut self.out_prefix);
+                                ui.text_edit_singleline(&mut self.job.output_prefix);
                             });
                             if ui.add_enabled(!self.is_running(), egui::Button::new("Load & Run Custom Pair")).clicked() {
                                 self.load_from_paths(ctx);
                             }
                         });
 
+                    egui::CollapsingHeader::new("Scriptability & JobSpec JSON")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Job");
+                                ui.text_edit_singleline(&mut self.job_file_path);
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.button("Export job.json").clicked() {
+                                    match self.job.save_file(Path::new(self.job_file_path.trim())) {
+                                        Ok(_) => self.log(format!("Saved JobSpec to {}", self.job_file_path)),
+                                        Err(e) => self.log(format!("Error saving job.json: {}", e)),
+                                    }
+                                }
+                                if ui.add_enabled(!self.is_running(), egui::Button::new("Load & Run job.json")).clicked() {
+                                    self.load_job_file(ctx);
+                                }
+                            });
+                            ui.checkbox(&mut self.job.resume, "Resume from 00_checkpoints/");
+                            ui.label(RichText::new(self.job.to_cli_command()).small().monospace().weak());
+                        });
+
                     egui::CollapsingHeader::new("Stage 0: stereo_pprc")
                         .default_open(true)
                         .show(ui, |ui| {
-                            ui.checkbox(&mut self.settings.normalize_intensity, "Normalize intensity");
+                            let s = &mut self.job.settings;
+                            ui.checkbox(&mut s.normalize_intensity, "Normalize intensity");
                             egui::ComboBox::from_label("Prefilter")
-                                .selected_text(self.settings.prefilter_mode.name())
+                                .selected_text(s.prefilter_mode.name())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.settings.prefilter_mode, PrefilterMode::None, "None");
-                                    ui.selectable_value(&mut self.settings.prefilter_mode, PrefilterMode::SubtractedMean, "SubtractedMean");
-                                    ui.selectable_value(&mut self.settings.prefilter_mode, PrefilterMode::LaplacianOfGaussian, "LoG");
+                                    ui.selectable_value(&mut s.prefilter_mode, PrefilterMode::None, "None");
+                                    ui.selectable_value(&mut s.prefilter_mode, PrefilterMode::SubtractedMean, "SubtractedMean");
+                                    ui.selectable_value(&mut s.prefilter_mode, PrefilterMode::LaplacianOfGaussian, "LoG");
                                 });
                             ui.add(
-                                egui::Slider::new(&mut self.settings.prefilter_kernel_width, 0.5..=25.0)
+                                egui::Slider::new(&mut s.prefilter_kernel_width, 0.5..=25.0)
                                     .text("Kernel width"),
                             );
                         });
@@ -527,76 +712,90 @@ impl eframe::App for StereoEguiApp {
                     egui::CollapsingHeader::new("Stage 1: stereo_corr")
                         .default_open(true)
                         .show(ui, |ui| {
+                            let s = &mut self.job.settings;
                             egui::ComboBox::from_label("Algorithm")
-                                .selected_text(self.settings.stereo_algorithm.name())
+                                .selected_text(s.stereo_algorithm.name())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.settings.stereo_algorithm, StereoAlgorithm::AspBm, "asp_bm (Vulkan/CPU)");
-                                    ui.selectable_value(&mut self.settings.stereo_algorithm, StereoAlgorithm::AspSgm, "asp_sgm (4-Path DP)");
-                                    ui.selectable_value(&mut self.settings.stereo_algorithm, StereoAlgorithm::AspMgm, "asp_mgm (Quadrant)");
+                                    ui.selectable_value(&mut s.stereo_algorithm, StereoAlgorithm::AspBm, "asp_bm (Vulkan/CPU)");
+                                    ui.selectable_value(&mut s.stereo_algorithm, StereoAlgorithm::AspSgm, "asp_sgm (4-Path DP)");
+                                    ui.selectable_value(&mut s.stereo_algorithm, StereoAlgorithm::AspMgm, "asp_mgm (Quadrant)");
                                 });
                             egui::ComboBox::from_label("Cost Metric")
-                                .selected_text(self.settings.cost_mode.name())
+                                .selected_text(s.cost_mode.name())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.settings.cost_mode, CostMode::Sad, "SAD");
-                                    ui.selectable_value(&mut self.settings.cost_mode, CostMode::Ssd, "SSD");
-                                    ui.selectable_value(&mut self.settings.cost_mode, CostMode::Ncc, "NCC (Zero-Mean)");
-                                    ui.selectable_value(&mut self.settings.cost_mode, CostMode::Census, "Census 5x5");
+                                    ui.selectable_value(&mut s.cost_mode, CostMode::Sad, "SAD");
+                                    ui.selectable_value(&mut s.cost_mode, CostMode::Ssd, "SSD");
+                                    ui.selectable_value(&mut s.cost_mode, CostMode::Ncc, "NCC (Zero-Mean)");
+                                    ui.selectable_value(&mut s.cost_mode, CostMode::Census, "Census 5x5");
                                 });
-                            let mut k = self.settings.corr_kernel_x;
+                            let mut k = s.corr_kernel_x;
                             if ui.add(egui::Slider::new(&mut k, 3..=21).step_by(2.0).text("Kernel")).changed() {
-                                self.settings.corr_kernel_x = k;
-                                self.settings.corr_kernel_y = k;
+                                s.corr_kernel_x = k;
+                                s.corr_kernel_y = k;
                             }
-                            ui.add(egui::Slider::new(&mut self.settings.search_min_x, -96..=0).text("Min dX"));
-                            ui.add(egui::Slider::new(&mut self.settings.search_max_x, 0..=96).text("Max dX"));
-                            ui.add(egui::Slider::new(&mut self.settings.sgm_p1, 0.02..=0.5).text("SGM P1"));
-                            ui.add(egui::Slider::new(&mut self.settings.sgm_p2, 0.1..=1.5).text("SGM P2"));
-                            ui.add(egui::Slider::new(&mut self.settings.lr_threshold, 0.5..=5.0).text("LR Check px"));
+                            ui.add(egui::Slider::new(&mut s.search_min_x, -96..=0).text("Min dX"));
+                            ui.add(egui::Slider::new(&mut s.search_max_x, 0..=96).text("Max dX"));
+                            ui.add(egui::Slider::new(&mut s.sgm_p1, 0.02..=0.5).text("SGM P1"));
+                            ui.add(egui::Slider::new(&mut s.sgm_p2, 0.1..=1.5).text("SGM P2"));
+                            ui.add(egui::Slider::new(&mut s.lr_threshold, 0.5..=5.0).text("LR Check px"));
                         });
 
                     egui::CollapsingHeader::new("Stage 2 & 3: rfne & fltr")
                         .default_open(true)
                         .show(ui, |ui| {
+                            let s = &mut self.job.settings;
                             egui::ComboBox::from_label("Subpixel")
-                                .selected_text(self.settings.subpixel_mode.name())
+                                .selected_text(s.subpixel_mode.name())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.settings.subpixel_mode, SubpixelMode::None, "None");
-                                    ui.selectable_value(&mut self.settings.subpixel_mode, SubpixelMode::Parabola, "Parabola");
-                                    ui.selectable_value(&mut self.settings.subpixel_mode, SubpixelMode::BayesEmAffine, "BayesEM-Affine");
-                                    ui.selectable_value(&mut self.settings.subpixel_mode, SubpixelMode::Affine, "Affine LK");
+                                    ui.selectable_value(&mut s.subpixel_mode, SubpixelMode::None, "None");
+                                    ui.selectable_value(&mut s.subpixel_mode, SubpixelMode::Parabola, "Parabola");
+                                    ui.selectable_value(&mut s.subpixel_mode, SubpixelMode::BayesEmAffine, "BayesEM-Affine");
+                                    ui.selectable_value(&mut s.subpixel_mode, SubpixelMode::Affine, "Affine LK");
                                 });
-                            ui.add(egui::Slider::new(&mut self.settings.rm_threshold, 0.5..=6.0).text("Outlier thresh"));
-                            ui.add(egui::Slider::new(&mut self.settings.rm_min_matches, 10..=90).text("Min matches %"));
-                            ui.checkbox(&mut self.settings.fill_holes, "Fill small disparity holes");
+                            ui.add(egui::Slider::new(&mut s.rm_threshold, 0.5..=6.0).text("Outlier thresh"));
+                            ui.add(egui::Slider::new(&mut s.rm_min_matches, 10..=90).text("Min matches %"));
+                            ui.checkbox(&mut s.fill_holes, "Fill small disparity holes");
                         });
 
-                    egui::CollapsingHeader::new("Stage 5: DEM, Hillshade & Compute")
+                    egui::CollapsingHeader::new("Stage 5: DEM, CRS & Compute")
                         .default_open(true)
                         .show(ui, |ui| {
+                            egui::ComboBox::from_label("CRS")
+                                .selected_text(self.job.crs.code())
+                                .show_ui(ui, |ui| {
+                                    for crs in CrsId::catalog() {
+                                        ui.selectable_value(&mut self.job.crs, crs, crs.display_name());
+                                    }
+                                });
+                            ui.add(
+                                egui::Slider::new(&mut self.job.tile_size, 64..=2048)
+                                    .step_by(64.0)
+                                    .text("Tile 1:1 px"),
+                            );
                             let az_changed = ui
-                                .add(egui::Slider::new(&mut self.settings.hillshade_azimuth_deg, 0.0..=360.0).text("Sun Azimuth"))
+                                .add(egui::Slider::new(&mut self.job.settings.hillshade_azimuth_deg, 0.0..=360.0).text("Sun Azimuth"))
                                 .changed();
                             let el_changed = ui
-                                .add(egui::Slider::new(&mut self.settings.hillshade_elevation_deg, 5.0..=85.0).text("Sun Elevation"))
+                                .add(egui::Slider::new(&mut self.job.settings.hillshade_elevation_deg, 5.0..=85.0).text("Sun Elevation"))
                                 .changed();
                             if az_changed || el_changed {
                                 self.recompute_hillshade_live();
                             }
                             egui::ComboBox::from_label("Backend")
-                                .selected_text(self.settings.backend.name())
+                                .selected_text(self.job.settings.backend.name())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.settings.backend, ComputeBackendPreference::Auto, "Auto (Vulkan -> CPU)");
-                                    ui.selectable_value(&mut self.settings.backend, ComputeBackendPreference::Vulkan, "Vulkan Compute");
-                                    ui.selectable_value(&mut self.settings.backend, ComputeBackendPreference::Cpu, "CPU Multi-thread");
+                                    ui.selectable_value(&mut self.job.settings.backend, ComputeBackendPreference::Auto, "Auto (Vulkan -> CPU)");
+                                    ui.selectable_value(&mut self.job.settings.backend, ComputeBackendPreference::Vulkan, "Vulkan Compute");
+                                    ui.selectable_value(&mut self.job.settings.backend, ComputeBackendPreference::Cpu, "CPU Multi-thread");
                                 });
-                            ui.add(egui::Slider::new(&mut self.settings.threads, 1..=32).text("CPU Threads"));
+                            ui.add(egui::Slider::new(&mut self.job.settings.threads, 1..=32).text("CPU Threads"));
                         });
                 });
             });
 
         // Right Telemetry & Diagnostics Panel
         egui::SidePanel::right("telemetry_panel")
-            .default_width(270.0)
+            .default_width(275.0)
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -661,6 +860,9 @@ impl eframe::App for StereoEguiApp {
                         ui.label("Vulkan Dispatches");
                         ui.monospace(format!("{}", t.vk_dispatches));
                         ui.end_row();
+                        ui.label("Settings Hash");
+                        ui.monospace(&self.job.settings_hash()[..10]);
+                        ui.end_row();
                     });
 
                     ui.add_space(8.0);
@@ -685,7 +887,6 @@ impl eframe::App for StereoEguiApp {
 
         // Central Interactive Viewport
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Layer Tabs & Colormap Bar
             ui.horizontal_wrapped(|ui| {
                 for &(layer, name) in &Layer::ALL {
                     if ui.selectable_label(self.active_layer == layer, name).clicked() {
@@ -788,23 +989,22 @@ impl StereoEguiApp {
             egui::StrokeKind::Outside,
         );
 
-        // Pixel inspector readout
         if let Some(pos) = resp.hover_pos() {
             if img_rect.contains(pos) {
                 let u = ((pos.x - img_rect.min.x) / img_rect.width()).clamp(0.0, 0.9999);
                 let v = ((pos.y - img_rect.min.y) / img_rect.height()).clamp(0.0, 0.9999);
                 let ix = (u * img.width as f32) as u32;
                 let iy = (v * img.height as f32) as u32;
-                let val = img.get(ix, iy);
-                self.hover_readout = if val.is_finite() {
-                    format!("Pixel ({:4}, {:4}) = {:9.3} {}", ix, iy, val, unit)
-                } else {
-                    format!("Pixel ({:4}, {:4}) = NoData / Occluded", ix, iy)
-                };
+                if let Some(val) = img.get_checked(ix, iy) {
+                    self.hover_readout = if val.is_finite() {
+                        format!("Pixel ({:4}, {:4}) = {:9.3} {}", ix, iy, val, unit)
+                    } else {
+                        format!("Pixel ({:4}, {:4}) = NoData / Occluded", ix, iy)
+                    };
+                }
             }
         }
 
-        // Colorbar overlay
         let (min_v, max_v, _, _) = img.stats();
         let bar_w = 180.0;
         let bar_h = 12.0;
@@ -948,7 +1148,7 @@ pub fn run_egui_gui(
 ) -> Result<(), String> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 860.0])
+            .with_inner_size([1420.0, 880.0])
             .with_min_inner_size([920.0, 600.0])
             .with_title("RustStereoPipelineVulkan — egui Stereo & DEM Studio"),
         ..Default::default()
