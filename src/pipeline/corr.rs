@@ -419,13 +419,14 @@ fn correlate_sgm(
         build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per)
     };
 
-    // 2. 8-path Edge-Aware SGM / MGM cost aggregation using L2-cache-friendly 2-row DP buffers
+    // 2. 8-path Edge-Aware SGM / MGM cost aggregation using AVX2 SIMD + L2-cache-friendly 2-row DP buffers
     //    Uses raw radiometric guide gradients so P2 stays strong on flat asphalt and drops cleanly at real edges.
     let p1 = s.sgm_p1;
     let p2_base = s.sgm_p2;
     let mut agg = vec![0.0f32; w * h * num_d];
+    let stride = num_d + 2;
 
-    // 2a. Horizontal passes (+X and -X) parallelized across all CPU threads directly into agg rows
+    // 2a. Horizontal passes (+X and -X) parallelized across all CPU threads with AVX2 SIMD
     std::thread::scope(|scope| {
         for (t, agg_chunk) in agg.chunks_mut(rows_per * w * num_d).enumerate() {
             let y_start = t * rows_per;
@@ -433,8 +434,8 @@ fn correlate_sgm(
             let gdata = &guide.data;
             scope.spawn(move || {
                 let rows = agg_chunk.len() / (w * num_d);
-                let mut prev_l = vec![0.0f32; num_d];
-                let mut cur_l = vec![0.0f32; num_d];
+                let mut prev_l = vec![f32::INFINITY; stride];
+                let mut cur_l = vec![f32::INFINITY; stride];
                 for ly in 0..rows {
                     let y = y_start + ly;
                     let row_pix = y * w;
@@ -442,57 +443,53 @@ fn correlate_sgm(
                     let row_agg = ly * w * num_d;
 
                     // Forward +X pass
+                    let mut min_prev = f32::INFINITY;
                     for d in 0..num_d {
                         let c = cv[row_cv + d];
-                        prev_l[d] = c;
+                        prev_l[d + 1] = c;
                         agg_chunk[row_agg + d] += c;
+                        if c < min_prev { min_prev = c; }
                     }
                     for x in 1..w {
                         let grad = (gdata[row_pix + x] - gdata[row_pix + x - 1]).abs();
                         let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
-                        let mut min_prev = f32::INFINITY;
-                        for d in 0..num_d {
-                            if prev_l[d] < min_prev { min_prev = prev_l[d]; }
-                        }
                         let c_off = row_cv + x * num_d;
                         let a_off = row_agg + x * num_d;
-                        let mp2 = min_prev + p2_eff;
-                        for d in 0..num_d {
-                            let c0 = prev_l[d];
-                            let cm = if d > 0 { prev_l[d - 1] + p1 } else { f32::INFINITY };
-                            let cp = if d + 1 < num_d { prev_l[d + 1] + p1 } else { f32::INFINITY };
-                            let v = cv[c_off + d] + (c0.min(cm).min(cp).min(mp2) - min_prev);
-                            cur_l[d] = v;
-                            agg_chunk[a_off + d] += v;
-                        }
+                        min_prev = crate::pipeline::simd::sgm_dp_step_add(
+                            &cv[c_off..c_off + num_d],
+                            &prev_l,
+                            &mut cur_l,
+                            &mut agg_chunk[a_off..a_off + num_d],
+                            min_prev,
+                            p1,
+                            p2_eff,
+                        );
                         std::mem::swap(&mut prev_l, &mut cur_l);
                     }
 
                     // Backward -X pass
                     let last_off = (w - 1) * num_d;
+                    min_prev = f32::INFINITY;
                     for d in 0..num_d {
                         let c = cv[row_cv + last_off + d];
-                        prev_l[d] = c;
+                        prev_l[d + 1] = c;
                         agg_chunk[row_agg + last_off + d] += c;
+                        if c < min_prev { min_prev = c; }
                     }
                     for x in (0..w - 1).rev() {
                         let grad = (gdata[row_pix + x] - gdata[row_pix + x + 1]).abs();
                         let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
-                        let mut min_prev = f32::INFINITY;
-                        for d in 0..num_d {
-                            if prev_l[d] < min_prev { min_prev = prev_l[d]; }
-                        }
                         let c_off = row_cv + x * num_d;
                         let a_off = row_agg + x * num_d;
-                        let mp2 = min_prev + p2_eff;
-                        for d in 0..num_d {
-                            let c0 = prev_l[d];
-                            let cm = if d > 0 { prev_l[d - 1] + p1 } else { f32::INFINITY };
-                            let cp = if d + 1 < num_d { prev_l[d + 1] + p1 } else { f32::INFINITY };
-                            let v = cv[c_off + d] + (c0.min(cm).min(cp).min(mp2) - min_prev);
-                            cur_l[d] = v;
-                            agg_chunk[a_off + d] += v;
-                        }
+                        min_prev = crate::pipeline::simd::sgm_dp_step_add(
+                            &cv[c_off..c_off + num_d],
+                            &prev_l,
+                            &mut cur_l,
+                            &mut agg_chunk[a_off..a_off + num_d],
+                            min_prev,
+                            p1,
+                            p2_eff,
+                        );
                         std::mem::swap(&mut prev_l, &mut cur_l);
                     }
                 }
@@ -500,88 +497,94 @@ fn correlate_sgm(
         }
     });
 
-    // 2b. Vertical & Diagonal passes (+Y, -Y, +1/+1, -1/+1, +1/-1, -1/-1) with compact 2-row L2-cache buffers
-    let vd_dirs: &[(i32, i32)] = &[(0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
-    let mut prev_row = vec![0.0f32; w * num_d];
-    let mut cur_row = vec![0.0f32; w * num_d];
-    let mut prev_mins = vec![0.0f32; w];
+    // 2b. Vertical & Diagonal passes (+Y, +1/+1, -1/+1 and -Y, +1/-1, -1/-1)
+    if !use_mgm {
+        // Multi-threaded AVX2 fused 3-direction sweeps (cuts DRAM traffic 3x + parallelizes across CPU cores)
+        run_sgm_fused_vd_sweep(&cost_vol, &guide.data, &mut agg, w, h, num_d, p1, p2_base, true, s.threads);
+        run_sgm_fused_vd_sweep(&cost_vol, &guide.data, &mut agg, w, h, num_d, p1, p2_base, false, s.threads);
+    } else {
+        // MGM 2D-quadrant passes with compact 2-row L2-cache buffers
+        let vd_dirs: &[(i32, i32)] = &[(0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+        let mut prev_row = vec![0.0f32; w * num_d];
+        let mut cur_row = vec![0.0f32; w * num_d];
+        let mut prev_mins = vec![0.0f32; w];
 
-    for &(dx_dir, dy_dir) in vd_dirs {
-        let y_iter: Vec<usize> = if dy_dir > 0 { (0..h).collect() } else { (0..h).rev().collect() };
-        let x_iter: Vec<usize> = if dx_dir >= 0 { (0..w).collect() } else { (0..w).rev().collect() };
-        let x_step = if dx_dir >= 0 { 1i32 } else { -1i32 };
+        for &(dx_dir, dy_dir) in vd_dirs {
+            let y_iter: Vec<usize> = if dy_dir > 0 { (0..h).collect() } else { (0..h).rev().collect() };
+            let x_iter: Vec<usize> = if dx_dir >= 0 { (0..w).collect() } else { (0..w).rev().collect() };
+            let x_step = if dx_dir >= 0 { 1i32 } else { -1i32 };
 
-        for (step_y, &y) in y_iter.iter().enumerate() {
-            let row_pix = y * w;
-            let py = y as i32 - dy_dir;
-            let has_prev_row = step_y > 0 && py >= 0 && py < h as i32;
+            for (step_y, &y) in y_iter.iter().enumerate() {
+                let row_pix = y * w;
+                let py = y as i32 - dy_dir;
+                let has_prev_row = step_y > 0 && py >= 0 && py < h as i32;
 
-            if has_prev_row {
-                for x in 0..w {
-                    let off = x * num_d;
-                    let mut mn = f32::INFINITY;
-                    for d in 0..num_d {
-                        if prev_row[off + d] < mn { mn = prev_row[off + d]; }
-                    }
-                    prev_mins[x] = mn;
-                }
-            }
-
-            for &x in &x_iter {
-                let px = x as i32 - dx_dir;
-                let idx = (row_pix + x) * num_d;
-                let dst = x * num_d;
-
-                if !has_prev_row || px < 0 || px >= w as i32 {
-                    for d in 0..num_d {
-                        let c = cost_vol[idx + d];
-                        cur_row[dst + d] = c;
-                        agg[idx + d] += c;
-                    }
-                } else {
-                    let px_u = px as usize;
-                    let p_off = px_u * num_d;
-                    let min_prev = prev_mins[px_u];
-                    let grad = (guide.data[row_pix + x] - guide.data[py as usize * w + px_u]).abs();
-                    let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
-                    let mp2 = min_prev + p2_eff;
-
-                    // For MGM, blend perpendicular already-visited neighbor on current row
-                    let qx = x as i32 - x_step;
-                    let (q_valid, q_off, min_q) = if use_mgm && qx >= 0 && qx < w as i32 {
-                        let qo = qx as usize * num_d;
-                        let mut mq = f32::INFINITY;
+                if has_prev_row {
+                    for x in 0..w {
+                        let off = x * num_d;
+                        let mut mn = f32::INFINITY;
                         for d in 0..num_d {
-                            if cur_row[qo + d] < mq { mq = cur_row[qo + d]; }
+                            if prev_row[off + d] < mn { mn = prev_row[off + d]; }
                         }
-                        (true, qo, mq)
-                    } else {
-                        (false, 0, 0.0)
-                    };
-                    let mq2 = min_q + p2_eff;
-
-                    for d in 0..num_d {
-                        let c0 = prev_row[p_off + d];
-                        let cm = if d > 0 { prev_row[p_off + d - 1] + p1 } else { f32::INFINITY };
-                        let cp = if d + 1 < num_d { prev_row[p_off + d + 1] + p1 } else { f32::INFINITY };
-                        let best_p = c0.min(cm).min(cp).min(mp2) - min_prev;
-
-                        let smooth = if q_valid {
-                            let q0 = cur_row[q_off + d];
-                            let qm = if d > 0 { cur_row[q_off + d - 1] + p1 } else { f32::INFINITY };
-                            let qp = if d + 1 < num_d { cur_row[q_off + d + 1] + p1 } else { f32::INFINITY };
-                            let best_q = q0.min(qm).min(qp).min(mq2) - min_q;
-                            0.5 * (best_p + best_q)
-                        } else {
-                            best_p
-                        };
-                        let v = cost_vol[idx + d] + smooth;
-                        cur_row[dst + d] = v;
-                        agg[idx + d] += v;
+                        prev_mins[x] = mn;
                     }
                 }
+
+                for &x in &x_iter {
+                    let px = x as i32 - dx_dir;
+                    let idx = (row_pix + x) * num_d;
+                    let dst = x * num_d;
+
+                    if !has_prev_row || px < 0 || px >= w as i32 {
+                        for d in 0..num_d {
+                            let c = cost_vol[idx + d];
+                            cur_row[dst + d] = c;
+                            agg[idx + d] += c;
+                        }
+                    } else {
+                        let px_u = px as usize;
+                        let p_off = px_u * num_d;
+                        let min_prev = prev_mins[px_u];
+                        let grad = (guide.data[row_pix + x] - guide.data[py as usize * w + px_u]).abs();
+                        let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
+                        let mp2 = min_prev + p2_eff;
+
+                        let qx = x as i32 - x_step;
+                        let (q_valid, q_off, min_q) = if qx >= 0 && qx < w as i32 {
+                            let qo = qx as usize * num_d;
+                            let mut mq = f32::INFINITY;
+                            for d in 0..num_d {
+                                if cur_row[qo + d] < mq { mq = cur_row[qo + d]; }
+                            }
+                            (true, qo, mq)
+                        } else {
+                            (false, 0, 0.0)
+                        };
+                        let mq2 = min_q + p2_eff;
+
+                        for d in 0..num_d {
+                            let c0 = prev_row[p_off + d];
+                            let cm = if d > 0 { prev_row[p_off + d - 1] + p1 } else { f32::INFINITY };
+                            let cp = if d + 1 < num_d { prev_row[p_off + d + 1] + p1 } else { f32::INFINITY };
+                            let best_p = c0.min(cm).min(cp).min(mp2) - min_prev;
+
+                            let smooth = if q_valid {
+                                let q0 = cur_row[q_off + d];
+                                let qm = if d > 0 { cur_row[q_off + d - 1] + p1 } else { f32::INFINITY };
+                                let qp = if d + 1 < num_d { cur_row[q_off + d + 1] + p1 } else { f32::INFINITY };
+                                let best_q = q0.min(qm).min(qp).min(mq2) - min_q;
+                                0.5 * (best_p + best_q)
+                            } else {
+                                best_p
+                            };
+                            let v = cost_vol[idx + d] + smooth;
+                            cur_row[dst + d] = v;
+                            agg[idx + d] += v;
+                        }
+                    }
+                }
+                std::mem::swap(&mut prev_row, &mut cur_row);
             }
-            std::mem::swap(&mut prev_row, &mut cur_row);
         }
     }
 
@@ -708,6 +711,182 @@ fn correlate_sgm(
     }
     disp.is_subpixel = do_subpixel;
     (disp, used_vk)
+}
+
+#[derive(Clone, Copy)]
+struct SyncMutF32Ptr(*mut f32);
+// SAFETY: Used exclusively inside `run_sgm_fused_vd_sweep` where each worker owns a strictly
+// disjoint column range `[x0..x1)` for writes, and double-buffered parity buffers are separated
+// by an acquire/release `std::sync::Barrier` between rows.
+unsafe impl Send for SyncMutF32Ptr {}
+unsafe impl Sync for SyncMutF32Ptr {}
+
+/// Multi-threaded AVX2 fused 3-direction SGM sweep:
+/// - `downward == true`:  fuses `(0, +1)`, `(+1, +1)`, `(-1, +1)` in ONE top-to-bottom scan
+/// - `downward == false`: fuses `(0, -1)`, `(+1, -1)`, `(-1, -1)` in ONE bottom-to-top scan
+/// Reduces `cost_vol` + `agg` DRAM bandwidth by 3x and parallelizes across CPU cores via a single `Barrier` scope.
+#[allow(clippy::too_many_arguments)]
+fn run_sgm_fused_vd_sweep(
+    cost_vol: &[f32],
+    guide: &[f32],
+    agg: &mut [f32],
+    w: usize,
+    h: usize,
+    num_d: usize,
+    p1: f32,
+    p2_base: f32,
+    downward: bool,
+    threads: usize,
+) {
+    if w == 0 || h == 0 || num_d == 0 {
+        return;
+    }
+    let stride = num_d + 2;
+    let dir_stride = w * stride;
+    // Double-buffered ping-pong buffers holding 3 directions [v, dl, dr] per parity (0 or 1)
+    let mut bufs = [vec![f32::INFINITY; 3 * dir_stride], vec![f32::INFINITY; 3 * dir_stride]];
+    let mut mins = [vec![0.0f32; 3 * w], vec![0.0f32; 3 * w]];
+
+    let n_workers = threads.clamp(1, 8).min((w / 32).max(1));
+    let cols_per = (w + n_workers - 1) / n_workers;
+    let active_workers = (w + cols_per - 1) / cols_per;
+    let barrier = std::sync::Barrier::new(active_workers);
+
+    let agg_ptr = SyncMutF32Ptr(agg.as_mut_ptr());
+    let buf0_ptr = SyncMutF32Ptr(bufs[0].as_mut_ptr());
+    let buf1_ptr = SyncMutF32Ptr(bufs[1].as_mut_ptr());
+    let min0_ptr = SyncMutF32Ptr(mins[0].as_mut_ptr());
+    let min1_ptr = SyncMutF32Ptr(mins[1].as_mut_ptr());
+
+    std::thread::scope(|scope| {
+        for t in 0..active_workers {
+            let x0 = t * cols_per;
+            let x1 = (x0 + cols_per).min(w);
+            let bar = &barrier;
+            scope.spawn(move || {
+                let agg_p = agg_ptr;
+                let buf_ptrs = [buf0_ptr, buf1_ptr];
+                let min_ptrs = [min0_ptr, min1_ptr];
+
+                for step_y in 0..h {
+                    let y = if downward { step_y } else { h - 1 - step_y };
+                    let py = if downward { y.wrapping_sub(1) } else { y + 1 };
+                    let cur_p = step_y & 1;
+                    let prev_p = 1 - cur_p;
+
+                    let row_pix = y * w;
+                    let prev_row_pix = py.wrapping_mul(w);
+
+                    // SAFETY: All workers read only `prev_p` (immutable after previous barrier)
+                    // and write exclusively to disjoint column slice `[x0..x1)` in `cur_p` and `agg[y]`.
+                    let prev_buf = unsafe { std::slice::from_raw_parts(buf_ptrs[prev_p].0, 3 * dir_stride) };
+                    let prev_min = unsafe { std::slice::from_raw_parts(min_ptrs[prev_p].0, 3 * w) };
+                    let cur_buf_ptr = buf_ptrs[cur_p].0;
+                    let cur_min_ptr = min_ptrs[cur_p].0;
+                    let agg_row_ptr = unsafe { agg_p.0.add(row_pix * num_d) };
+
+                    for x in x0..x1 {
+                        let cv_off = (row_pix + x) * num_d;
+                        let cv_s = &cost_vol[cv_off..cv_off + num_d];
+                        let agg_s = unsafe { std::slice::from_raw_parts_mut(agg_row_ptr.add(x * num_d), num_d) };
+                        let cur_v = unsafe { std::slice::from_raw_parts_mut(cur_buf_ptr.add(x * stride), stride) };
+                        let cur_dl = unsafe { std::slice::from_raw_parts_mut(cur_buf_ptr.add(dir_stride + x * stride), stride) };
+                        let cur_dr = unsafe { std::slice::from_raw_parts_mut(cur_buf_ptr.add(2 * dir_stride + x * stride), stride) };
+
+                        if step_y == 0 {
+                            let mut mn = f32::INFINITY;
+                            for d in 0..num_d {
+                                let c = cv_s[d];
+                                cur_v[d + 1] = c;
+                                cur_dl[d + 1] = c;
+                                cur_dr[d + 1] = c;
+                                agg_s[d] += 3.0 * c;
+                                if c < mn { mn = c; }
+                            }
+                            unsafe {
+                                *cur_min_ptr.add(x) = mn;
+                                *cur_min_ptr.add(w + x) = mn;
+                                *cur_min_ptr.add(2 * w + x) = mn;
+                            }
+                        } else {
+                            let gx = guide[row_pix + x];
+
+                            // Direction 0: Vertical (0, ±1) from (x, py)
+                            let grad_v = (gx - guide[prev_row_pix + x]).abs();
+                            let p2_v = (p2_base / (1.0 + 10.0 * grad_v)).max(p1 * 1.5);
+                            let mv = crate::pipeline::simd::sgm_dp_step_add(
+                                cv_s,
+                                &prev_buf[x * stride..(x + 1) * stride],
+                                cur_v,
+                                agg_s,
+                                prev_min[x],
+                                p1,
+                                p2_v,
+                            );
+
+                            // Direction 1: Diagonal (+1, ±1) from (x - 1, py)
+                            let mdl = if x > 0 {
+                                let px = x - 1;
+                                let grad_dl = (gx - guide[prev_row_pix + px]).abs();
+                                let p2_dl = (p2_base / (1.0 + 10.0 * grad_dl)).max(p1 * 1.5);
+                                crate::pipeline::simd::sgm_dp_step_add(
+                                    cv_s,
+                                    &prev_buf[dir_stride + px * stride..dir_stride + (px + 1) * stride],
+                                    cur_dl,
+                                    agg_s,
+                                    prev_min[w + px],
+                                    p1,
+                                    p2_dl,
+                                )
+                            } else {
+                                let mut mn = f32::INFINITY;
+                                for d in 0..num_d {
+                                    let c = cv_s[d];
+                                    cur_dl[d + 1] = c;
+                                    agg_s[d] += c;
+                                    if c < mn { mn = c; }
+                                }
+                                mn
+                            };
+
+                            // Direction 2: Diagonal (-1, ±1) from (x + 1, py)
+                            let mdr = if x + 1 < w {
+                                let px = x + 1;
+                                let grad_dr = (gx - guide[prev_row_pix + px]).abs();
+                                let p2_dr = (p2_base / (1.0 + 10.0 * grad_dr)).max(p1 * 1.5);
+                                crate::pipeline::simd::sgm_dp_step_add(
+                                    cv_s,
+                                    &prev_buf[2 * dir_stride + px * stride..2 * dir_stride + (px + 1) * stride],
+                                    cur_dr,
+                                    agg_s,
+                                    prev_min[2 * w + px],
+                                    p1,
+                                    p2_dr,
+                                )
+                            } else {
+                                let mut mn = f32::INFINITY;
+                                for d in 0..num_d {
+                                    let c = cv_s[d];
+                                    cur_dr[d + 1] = c;
+                                    agg_s[d] += c;
+                                    if c < mn { mn = c; }
+                                }
+                                mn
+                            };
+
+                            unsafe {
+                                *cur_min_ptr.add(x) = mv;
+                                *cur_min_ptr.add(w + x) = mdl;
+                                *cur_min_ptr.add(2 * w + x) = mdr;
+                            }
+                        }
+                    }
+
+                    bar.wait();
+                }
+            });
+        }
+    });
 }
 
 fn build_cost_volume_cpu(
@@ -849,5 +1028,80 @@ mod tests {
         let mae = err_sum / cnt as f64;
         assert!(mae < 0.15, "Subpixel SGM MAE too high for -3.4 px shift: {:.4}", mae);
         assert!(frac_cnt * 2 > cnt, "Expected continuous fractional subpixel estimates, got {}/{}", frac_cnt, cnt);
+    }
+
+    #[test]
+    fn test_fused_sgm_matches_reference_6_passes() {
+        let w = 96usize;
+        let h = 40usize;
+        let num_d = 25usize;
+        let p1 = 0.12f32;
+        let p2_base = 0.48f32;
+
+        let mut cv = vec![0.0f32; w * h * num_d];
+        let mut guide = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                guide[y * w + x] = ((x * 7 + y * 13) % 100) as f32 / 100.0;
+                for d in 0..num_d {
+                    cv[(y * w + x) * num_d + d] =
+                        0.1 + (((x * 31 + y * 17 + d * 11) % 97) as f32) / 100.0;
+                }
+            }
+        }
+
+        // Reference sequential 6-direction aggregation
+        let mut agg_ref = vec![0.0f32; w * h * num_d];
+        for &(dx_dir, dy_dir) in &[(0i32, 1i32), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)] {
+            let mut prev = vec![0.0f32; w * num_d];
+            let mut cur = vec![0.0f32; w * num_d];
+            let y_iter: Vec<usize> = if dy_dir > 0 { (0..h).collect() } else { (0..h).rev().collect() };
+            for (step_y, &y) in y_iter.iter().enumerate() {
+                let py = y as i32 - dy_dir;
+                let has_prev = step_y > 0 && py >= 0 && py < h as i32;
+                for x in 0..w {
+                    let px = x as i32 - dx_dir;
+                    let idx = (y * w + x) * num_d;
+                    if !has_prev || px < 0 || px >= w as i32 {
+                        for d in 0..num_d {
+                            let c = cv[idx + d];
+                            cur[x * num_d + d] = c;
+                            agg_ref[idx + d] += c;
+                        }
+                    } else {
+                        let px_u = px as usize;
+                        let po = px_u * num_d;
+                        let mut mn = f32::INFINITY;
+                        for d in 0..num_d {
+                            if prev[po + d] < mn { mn = prev[po + d]; }
+                        }
+                        let grad = (guide[y * w + x] - guide[py as usize * w + px_u]).abs();
+                        let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
+                        let mp2 = mn + p2_eff;
+                        for d in 0..num_d {
+                            let c0 = prev[po + d];
+                            let cm = if d > 0 { prev[po + d - 1] + p1 } else { f32::INFINITY };
+                            let cp = if d + 1 < num_d { prev[po + d + 1] + p1 } else { f32::INFINITY };
+                            let v = cv[idx + d] + (c0.min(cm).min(cp).min(mp2) - mn);
+                            cur[x * num_d + d] = v;
+                            agg_ref[idx + d] += v;
+                        }
+                    }
+                }
+                std::mem::swap(&mut prev, &mut cur);
+            }
+        }
+
+        // Parallel fused AVX2 downward + upward sweeps (4 workers)
+        let mut agg_fused = vec![0.0f32; w * h * num_d];
+        run_sgm_fused_vd_sweep(&cv, &guide, &mut agg_fused, w, h, num_d, p1, p2_base, true, 4);
+        run_sgm_fused_vd_sweep(&cv, &guide, &mut agg_fused, w, h, num_d, p1, p2_base, false, 4);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..agg_ref.len() {
+            let diff = (agg_ref[i] - agg_fused[i]).abs();
+            if diff > max_diff { max_diff = diff; }
+        }
+        assert!(max_diff < 1e-4, "Fused SGM diverged from reference: max_diff={}", max_diff);
     }
 }
