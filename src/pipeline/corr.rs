@@ -409,7 +409,11 @@ fn correlate_sgm(
                 used_vk = true;
                 vol
             }
-            _ => build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per),
+            Err(e) => {
+                eprintln!("[WARN] Vulkan 3D cost volume fallback to CPU: {}", e);
+                build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per)
+            }
+            Ok(_) => build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per),
         }
     } else {
         build_cost_volume_cpu(left, right, s, min_d, num_d, hkw, hkh, rows_per)

@@ -384,6 +384,22 @@ impl VulkanCompute {
         None
     }
 
+    /// Prefer `HOST_VISIBLE | HOST_COHERENT | HOST_CACHED` memory for GPU->CPU readback buffers
+    /// (avoids slow uncached PCIe WC readback stalls on discrete GPUs), falling back to host-coherent.
+    fn find_host_cached_memory(&self, type_bits: u32) -> Option<u32> {
+        let cached = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+            | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+            | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        for i in 0..self.mem_props.memoryTypeCount {
+            if (type_bits & (1 << i)) != 0
+                && (self.mem_props.memoryTypes[i as usize].propertyFlags & cached) == cached
+            {
+                return Some(i);
+            }
+        }
+        self.find_host_coherent_memory(type_bits)
+    }
+
     fn create_buffer_with_data(&self, bytes: &[u8]) -> Result<(VkBuffer, VkDeviceMemory, VkDeviceSize), String> {
         let size = (bytes.len().max(4)) as VkDeviceSize;
         let b_ci = VkBufferCreateInfo {
@@ -447,7 +463,7 @@ impl VulkanCompute {
         Ok((buffer, mem, size))
     }
 
-    /// Allocate a host-visible GPU storage buffer of `byte_len` bytes WITHOUT uploading zeros from CPU.
+    /// Allocate a host-visible cached GPU storage buffer of `byte_len` bytes WITHOUT uploading zeros from CPU.
     fn create_uninit_buffer(&self, byte_len: usize) -> Result<(VkBuffer, VkDeviceMemory, VkDeviceSize), String> {
         let size = byte_len.max(4) as VkDeviceSize;
         let buf_ci = VkBufferCreateInfo {
@@ -468,7 +484,7 @@ impl VulkanCompute {
         let mut reqs = VkMemoryRequirements::default();
         unsafe { (self.vk.vkGetBufferMemoryRequirements)(self.device, buffer, &mut reqs) };
         let mem_type = self
-            .find_host_coherent_memory(reqs.memoryTypeBits)
+            .find_host_cached_memory(reqs.memoryTypeBits)
             .ok_or_else(|| "No HOST_VISIBLE|HOST_COHERENT Vulkan memory type found".to_string())?;
         let alloc_ci = VkMemoryAllocateInfo {
             sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -757,7 +773,11 @@ impl VulkanCompute {
     }
 
     /// Run GPU 3D Stereo Cost Volume computation (`C[y][x][d]` for SGM & MGM) via cached SPIR-V pipeline.
-    /// Computes normalized SAD (0), SSD (1), or Zero-Mean NCC (2) for `num_d` horizontal disparities.
+    /// Computes normalized SAD (0), SSD (1), hybrid ZNCC+Census (2), or Census (3) for `num_d` disparities.
+    /// Automatically splits large volumes into halo-padded Y-slabs (<= 240 MB per GPU dispatch) so any
+    /// ROI size (`1024x1024x129`, `2048x2048x129`, etc.) executes on Vulkan GPU without exceeding
+    /// `maxStorageBufferRange`, PCIe BAR limits, or 32-bit SPIR-V buffer indexing.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_stereo_cost_volume(
         &self,
         left: &[f32],
@@ -770,37 +790,89 @@ impl VulkanCompute {
         num_d: usize,
         cost_mode: i32,
     ) -> Result<Vec<f32>, String> {
-        let vol_elems = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(num_d))
+        let w = width as usize;
+        let h = height as usize;
+        let row_elems = w
+            .checked_mul(num_d)
+            .ok_or_else(|| "Cost volume row stride overflow".to_string())?;
+        let total_elems = row_elems
+            .checked_mul(h)
             .ok_or_else(|| "Cost volume size overflow".to_string())?;
-        // Guard VRAM/staging allocation to 512 MB max per dispatch
-        if vol_elems * 4 > 512 * 1024 * 1024 {
-            return Err("Cost volume exceeds 512 MB single-dispatch guard".to_string());
+        if w == 0 || h == 0 || num_d == 0 {
+            return Ok(Vec::new());
         }
-        let params: [i32; 7] = [
-            width as i32,
-            height as i32,
-            half_kw,
-            half_kh,
-            min_dx,
-            num_d as i32,
-            cost_mode,
-        ];
-        let res = self.dispatch_cached_io(
-            ShaderKind::StereoCostVolume3d,
-            &[
-                Ok(as_bytes(left)),
-                Ok(as_bytes(right)),
-                Err(vol_elems * 4),
-                Ok(as_bytes(&params)),
-            ],
-            &[2],
-            (width + 15) / 16,
-            (height + 15) / 16,
-            1,
-        )?;
-        Ok(bytes_to_f32(&res[0]))
+
+        // Keep each Vulkan storage buffer <= 240 MB (safe for 256 MB BARs & 32-bit SPIR-V indexing)
+        let max_slab_bytes: usize = 240 * 1024 * 1024;
+        let pad_rows = half_kh.max(0) as usize;
+        let slabs = plan_cost_volume_slabs(h, row_elems * 4, pad_rows, max_slab_bytes);
+
+        if slabs.len() == 1 {
+            let params: [i32; 7] = [
+                width as i32,
+                height as i32,
+                half_kw,
+                half_kh,
+                min_dx,
+                num_d as i32,
+                cost_mode,
+            ];
+            let res = self.dispatch_cached_io(
+                ShaderKind::StereoCostVolume3d,
+                &[
+                    Ok(as_bytes(left)),
+                    Ok(as_bytes(right)),
+                    Err(total_elems * 4),
+                    Ok(as_bytes(&params)),
+                ],
+                &[2],
+                (width + 15) / 16,
+                (height + 15) / 16,
+                1,
+            )?;
+            return Ok(bytes_to_f32(&res[0]));
+        }
+
+        let mut out_vol = vec![0.0f32; total_elems];
+        for slab in slabs {
+            let src_start = slab.src_y0 * w;
+            let src_end = slab.src_y1 * w;
+            let sub_h = (slab.src_y1 - slab.src_y0) as u32;
+            let sub_elems = (sub_h as usize) * row_elems;
+            let params: [i32; 7] = [
+                width as i32,
+                sub_h as i32,
+                half_kw,
+                half_kh,
+                min_dx,
+                num_d as i32,
+                cost_mode,
+            ];
+            let res = self.dispatch_cached_io(
+                ShaderKind::StereoCostVolume3d,
+                &[
+                    Ok(as_bytes(&left[src_start..src_end])),
+                    Ok(as_bytes(&right[src_start..src_end])),
+                    Err(sub_elems * 4),
+                    Ok(as_bytes(&params)),
+                ],
+                &[2],
+                (width + 15) / 16,
+                (sub_h + 15) / 16,
+                1,
+            )?;
+            let keep_start_elems = (slab.core_y0 - slab.src_y0) * row_elems;
+            let keep_elems = (slab.core_y1 - slab.core_y0) * row_elems;
+            let dst_start = slab.core_y0 * row_elems;
+            let byte_slice = &res[0][keep_start_elems * 4..(keep_start_elems + keep_elems) * 4];
+            for (dst, chunk) in out_vol[dst_start..dst_start + keep_elems]
+                .iter_mut()
+                .zip(byte_slice.chunks_exact(4))
+            {
+                *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+        Ok(out_vol)
     }
 
     /// Run GPU Subpixel Parabola refinement via cached SPIR-V compute pipeline.
@@ -890,4 +962,80 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CostVolumeSlab {
+    core_y0: usize,
+    core_y1: usize,
+    src_y0: usize,
+    src_y1: usize,
+}
+
+/// Partition `height` rows into halo-padded Y-slabs whose padded GPU storage buffer fits within `max_slab_bytes`.
+fn plan_cost_volume_slabs(
+    height: usize,
+    row_bytes: usize,
+    pad_rows: usize,
+    max_slab_bytes: usize,
+) -> Vec<CostVolumeSlab> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let total_bytes = height.saturating_mul(row_bytes);
+    if row_bytes == 0 || total_bytes <= max_slab_bytes {
+        return vec![CostVolumeSlab {
+            core_y0: 0,
+            core_y1: height,
+            src_y0: 0,
+            src_y1: height,
+        }];
+    }
+    let max_padded_rows = (max_slab_bytes / row_bytes).max(1 + 2 * pad_rows);
+    let core_step = max_padded_rows.saturating_sub(2 * pad_rows).max(1);
+    let mut slabs = Vec::new();
+    let mut y0 = 0usize;
+    while y0 < height {
+        let y1 = (y0 + core_step).min(height);
+        let src_y0 = y0.saturating_sub(pad_rows);
+        let src_y1 = (y1 + pad_rows).min(height);
+        slabs.push(CostVolumeSlab {
+            core_y0: y0,
+            core_y1: y1,
+            src_y0,
+            src_y1,
+        });
+        y0 = y1;
+    }
+    slabs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cost_volume_y_slab_planner_1024x1024x129() {
+        // Real Meyreuil 1024x1024x129 = 516 MB -> splits cleanly into <= 240 MB slabs with 4-row halo
+        let row_bytes = 1024 * 129 * 4;
+        let max_bytes = 240 * 1024 * 1024;
+        let slabs = plan_cost_volume_slabs(1024, row_bytes, 4, max_bytes);
+        assert_eq!(slabs.len(), 3);
+        assert_eq!(slabs[0].core_y0, 0);
+        assert_eq!(slabs.last().unwrap().core_y1, 1024);
+        for (i, s) in slabs.iter().enumerate() {
+            let padded_bytes = (s.src_y1 - s.src_y0) * row_bytes;
+            assert!(padded_bytes <= max_bytes, "Slab {} exceeded budget: {} bytes", i, padded_bytes);
+            if i > 0 {
+                assert_eq!(s.core_y0, slabs[i - 1].core_y1);
+                assert_eq!(s.src_y0, s.core_y0 - 4);
+            }
+            if i + 1 < slabs.len() {
+                assert_eq!(s.src_y1, s.core_y1 + 4);
+            }
+        }
+        // Small volumes stay single-dispatch
+        let single = plan_cost_volume_slabs(256, 256 * 64 * 4, 4, max_bytes);
+        assert_eq!(single.len(), 1);
+    }
 }
