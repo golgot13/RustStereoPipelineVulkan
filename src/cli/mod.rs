@@ -13,15 +13,13 @@ use crate::config::{
 };
 use crate::core::cancel::CancellationToken;
 use crate::core::chantier::{
-    chantier_summary_json, load_source_band_for_tiles, plan_full_model,
-    prepare_stereo_pair_roi_opts, rectify_full_model_tile, validate_dem_against_gcps, Chantier,
+    chantier_summary_json, prepare_stereo_pair_roi_opts, validate_dem_against_gcps, Chantier,
 };
-use crate::core::chantier_calib::pair_gcp_epipolar_dy;
+use crate::core::chantier_runner::{run_full_model_with_monitor, ChantierRunConfig};
 use crate::core::crs::{transform_point, CrsId};
 use crate::core::error::{PipelineError, Result};
 use crate::core::hardware::{HardwareProfile, ProfileTier};
 use crate::core::job::{JobInput, JobSpec, StageId};
-use crate::image::geotiff::GeoTiffReader;
 use crate::image::io::{
     encode_png_rgba, load_image, load_point_cloud_xyz, save_image, save_tiff_f32,
     stream_ply_vertices, GeoTransform, PointCloudMerger,
@@ -30,6 +28,8 @@ use crate::image::{Colormap, PointCloud};
 use crate::math::Vec3;
 use crate::pipeline::dag::{WorkflowEvent, WorkflowExecutor};
 use crate::pipeline::{align, dem, pprc, synthetic, StereoPipelineEngine};
+use crate::ui::live_monitor::LiveChantierMonitor;
+use crate::ui::web::spawn_live_monitor_server;
 use crate::ui::{launch_gui, UiMode};
 use crate::vulkan::shaders::shader_catalog;
 use crate::vulkan::spirv::validate_spirv;
@@ -62,8 +62,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
         "synthetic" => cmd_synthetic(rest),
         "vulkan-info" => cmd_vulkan_info(),
         "gui" | "stereo_gui" => cmd_gui(rest, UiMode::Auto),
-        "egui" => cmd_gui(rest, UiMode::Egui),
-        "web-ui" => cmd_gui(rest, UiMode::Web),
+        "web-ui" | "egui" => cmd_gui(rest, UiMode::Web),
         other => Err(PipelineError::Cli(format!(
             "Unknown subcommand '{}'. Run with --help to see available commands.",
             other
@@ -73,16 +72,17 @@ pub fn run_cli(args: &[String]) -> Result<()> {
 
 fn print_help() {
     println!(
-        r#"RustStereoPipelineVulkan v0.2.0 — Modular Rust + Vulkan Compute Stereo Pipeline
+        r#"RustStereoPipelineVulkan v0.2.0 — Zero-Dependency Rust + Vulkan Compute Stereo Pipeline
 
 USAGE:
   stereo-pipeline <COMMAND> [ARGS...] [OPTIONS...]
 
 COMMANDS:
-  chantier <chantier_dir> [--output <dir>] [--pair N | --all-pairs] [--full-model] [--express] [--roi-size 1024] [--merge-voxel <m>]
-      Auto-discover .CAM, trajectory .TXT, GCP, GCP_picks*.json, footprints JSON, and GeoTIFF stereo pairs
+  chantier <chantier_dir> [--output <dir>] [--pair N | --all-pairs] [--full-model] [--express] [--roi-size 1024] [--live-ui] [--port 8080]
+      Auto-discover .CAM, trajectory .TXT, GCP, GCP_picks*.json, footprints JSON, IGN LiDAR HD .laz, and GeoTIFF stereo pairs
       and run streaming Full-Scale 1:1 stereo reconstruction into Output_stereopipeline
-      (--full-model processes ALL 1:1 tiles covering the entire stereo overlap; --express skips all intermediate outputs)
+      (--full-model processes ALL 1:1 tiles covering the entire stereo overlap; --express skips intermediate outputs;
+       --live-ui opens the zero-dependency real-time 2D mosaic + WebGL 3D point cloud monitor in your browser)
   merge-ply <dir_or_ply1 ...> --output <merged.ply> [--merge-voxel <m>]
       Fuse existing colorized binary/ASCII PLY point clouds into a single RGB f64 binary PLY
   stereo <L.tif> <R.tif> <L.tsai|rpb> <R.tsai|rpb> <out_prefix>
@@ -107,12 +107,10 @@ COMMANDS:
       List supported Coordinate Reference Systems
   vulkan-info
       Probe Vulkan Compute hardware devices, HardwareProfile/AVX2, and validate SPIR-V 1.0 shaders
-  egui [L.tif R.tif L.tsai R.tsai] [options]
-      Launch the interactive egui/eframe Desktop Studio
-  gui [L.tif R.tif L.tsai R.tsai] [--egui | --x11 | --web] [--port 8080]
-      Launch Hybrid GUI (egui Studio, Native X11 window, or Embedded Web UI)
+  gui [L.tif R.tif L.tsai R.tsai] [--web | --x11] [--port 8080]
+      Launch Zero-Dependency Real-Time 2D/3D Photogrammetry Workstation (opens browser automatically)
   web-ui [L.tif R.tif L.tsai R.tsai] [--port 8080]
-      Launch Embedded HTTP/1.1 + SSE Web UI workstation directly
+      Launch Embedded HTTP/1.1 + SSE Real-Time 2D/3D Web Workstation directly
 
 SCRIPTING & ROBUSTNESS OPTIONS:
   --job <file.json | ->          Load JobSpec JSON manifest (`-` reads stdin)
@@ -132,6 +130,8 @@ SCRIPTING & ROBUSTNESS OPTIONS:
   --no-ign-lidar                 Disable local IGN LiDAR HD MNT/MNS terrain model loading
   --full-model                   Process ALL 1:1 tiles covering the complete overlap of each stereo model
   --express                      Express benchmark mode: ZERO intermediate outputs (only dense RGB f64 PLY + exact timings)
+  --live-ui                      Open live real-time 2D mosaic + WebGL 3D point cloud monitor in browser during chantier calculation
+  --port <N>                     HTTP port for Live UI / Web Workstation (default: 8080)
   --merge-cloud                  Produce unified RGB f64 chantier_merged-PC.ply (auto-ON for --all-pairs)
   --no-merge-cloud               Disable unified chantier_merged-PC.ply export
   --merge-voxel <meters>         3D voxel fusion resolution in meters (0 = lossless full-res streaming; e.g. 0.05)
@@ -200,6 +200,7 @@ struct ParsedArgs {
     no_gcp_refine: bool,
     ign_data_path: Option<String>,
     no_ign_lidar: bool,
+    live_ui: bool,
 }
 
 fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
@@ -246,6 +247,7 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
     let mut no_gcp_refine = false;
     let mut ign_data_path = None;
     let mut no_ign_lidar = false;
+    let mut live_ui = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -309,9 +311,8 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
             "--port" => {
                 port = next(&mut i, a)?.parse().map_err(|_| PipelineError::Cli("Invalid --port".into()))?;
             }
-            "--egui" => ui_mode = Some(UiMode::Egui),
+            "--egui" | "--web" => ui_mode = Some(UiMode::Web),
             "--x11" => ui_mode = Some(UiMode::X11),
-            "--web" => ui_mode = Some(UiMode::Web),
             "--cmap" => cmap = Colormap::from_name(next(&mut i, a)?),
             "--max-iters" => {
                 max_iters = next(&mut i, a)?.parse().map_err(|_| PipelineError::Cli("Invalid --max-iters".into()))?;
@@ -354,6 +355,7 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
             "--ign-data" => ign_data_path = Some(next(&mut i, a)?.to_string()),
             "--no-ign-lidar" => no_ign_lidar = true,
             "--full-model" => full_model = true,
+            "--live-ui" => live_ui = true,
             "--express" => {
                 express = true;
                 fast_io = true;
@@ -431,6 +433,7 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
         no_gcp_refine,
         ign_data_path,
         no_ign_lidar,
+        live_ui,
     })
 }
 
@@ -527,6 +530,48 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| root_path.join("Output_stereopipeline"));
     std::fs::create_dir_all(&out_dir)?;
+
+    let live_monitor = if p.live_ui {
+        let mon = LiveChantierMonitor::new();
+        let cfg_preview = ChantierRunConfig {
+            chantier_dir: root_path.to_path_buf(),
+            output_dir: p.output_dir.as_ref().map(PathBuf::from),
+            pair_idx: p.pair_idx,
+            all_pairs: p.all_pairs,
+            roi_size: p.roi_size,
+            express: p.express,
+            no_merge_cloud: p.no_merge_cloud,
+            merge_voxel: p.merge_voxel,
+            custom_search: p.custom_search,
+            gcp_picks_path: p.gcp_picks_path.as_ref().map(PathBuf::from),
+            footprints_path: p.footprints_path.as_ref().map(PathBuf::from),
+            no_gcp_refine: p.no_gcp_refine,
+            ign_data_path: p.ign_data_path.as_ref().map(PathBuf::from),
+            no_ign_lidar: p.no_ign_lidar,
+            ndjson: p.ndjson,
+            settings: p.settings.clone(),
+        };
+        mon.set_discovering(&root_path.display().to_string(), &cfg_preview.to_cli_command());
+        match spawn_live_monitor_server(std::sync::Arc::clone(&mon), p.port, true) {
+            Ok(bound_port) => {
+                if !p.ndjson {
+                    use std::io::Write;
+                    println!(
+                        "[Live UI] Suivi temps réel 2D/3D ouvert sur http://127.0.0.1:{}",
+                        bound_port
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+                Some((mon, bound_port))
+            }
+            Err(e) => {
+                eprintln!("[Live UI WARN] Impossible de démarrer le serveur live : {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     if !p.ndjson {
         use std::io::Write;
@@ -665,7 +710,40 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
 
     let engine = StereoPipelineEngine::new(p.settings.backend);
     if p.full_model {
-        return run_chantier_full_model(&chantier, &selected, &out_dir, &p, &engine);
+        let cfg = ChantierRunConfig {
+            chantier_dir: root_path.to_path_buf(),
+            output_dir: p.output_dir.as_ref().map(PathBuf::from),
+            pair_idx: p.pair_idx,
+            all_pairs: p.all_pairs,
+            roi_size: p.roi_size,
+            express: p.express,
+            no_merge_cloud: p.no_merge_cloud,
+            merge_voxel: p.merge_voxel,
+            custom_search: p.custom_search,
+            gcp_picks_path: p.gcp_picks_path.as_ref().map(PathBuf::from),
+            footprints_path: p.footprints_path.as_ref().map(PathBuf::from),
+            no_gcp_refine: p.no_gcp_refine,
+            ign_data_path: p.ign_data_path.as_ref().map(PathBuf::from),
+            no_ign_lidar: p.no_ign_lidar,
+            ndjson: p.ndjson,
+            settings: p.settings.clone(),
+        };
+        let mon_ref = live_monitor.as_ref().map(|(m, _)| m.as_ref());
+        let res = run_full_model_with_monitor(&chantier, &selected, &out_dir, &cfg, &engine, mon_ref, false);
+        if let Some((_, bound_port)) = live_monitor {
+            if !p.ndjson {
+                use std::io::Write;
+                println!(
+                    "\n[Live UI] Calcul terminé — résultats 2D/3D toujours accessibles sur http://127.0.0.1:{}",
+                    bound_port
+                );
+                print!("[Live UI] Appuyez sur Entrée (ou Ctrl+C) pour fermer le serveur...");
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+            }
+        }
+        return res;
     }
 
     let cancel = CancellationToken::new();
@@ -899,379 +977,6 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         }
         println!("  Résumé JSON            : {}", summary_path.display());
     }
-    Ok(())
-}
-
-/// Full-Scale 1:1 complete stereo model reconstruction in Express mode:
-/// - Covers the ENTIRE overlap of each selected stereo pair using halo-padded sliding windows
-/// - Caches each source GeoTIFF strip-band ONCE in RAM (parallel Deflate decode)
-/// - Produces ZERO intermediate files (no DEM/hillshade/PNG/TIFF/checkpoints)
-/// - Streams dense colorized RGB `f64` 3D points directly to `<pair>-FULL-PC.ply` (and `chantier_merged-PC.ply` for `--all-pairs`)
-/// - Reports exact per-stage timings, Mpx/s throughput, and live ETA.
-fn run_chantier_full_model(
-    chantier: &Chantier,
-    selected: &[usize],
-    out_dir: &Path,
-    p: &ParsedArgs,
-    engine: &StereoPipelineEngine,
-) -> Result<()> {
-    use std::io::Write;
-    let hw = HardwareProfile::detect();
-    let global_merge = selected.len() > 1 && !p.no_merge_cloud;
-    let global_ply_path = out_dir.join("chantier_merged-PC.ply");
-    let mut global_merger = if global_merge {
-        Some(PointCloudMerger::new(&global_ply_path, p.merge_voxel)?)
-    } else {
-        None
-    };
-
-    if !p.ndjson {
-        println!(
-            "  Mode Calcul  : FULL-MODEL 1:1 {} (dalles {}x{}, 0 sortie intermédiaire)",
-            if p.express { "EXPRESS" } else { "COMPLET" },
-            p.roi_size,
-            p.roi_size
-        );
-        println!(
-            "  Backend      : {} | {} threads CPU (AVX2: {})",
-            engine.vulkan_status, p.settings.threads, hw.avx2_supported
-        );
-        if global_merge {
-            println!("  Nuage Global : {}", global_ply_path.display());
-        }
-    }
-
-    let t_global = std::time::Instant::now();
-    let mut global_tiles_done = 0usize;
-    let mut global_core_pixels = 0u64;
-    let mut global_points = 0usize;
-
-    for &idx in selected {
-        let pair = &chantier.pairs[idx];
-        let t_model = std::time::Instant::now();
-        let reader_l = GeoTiffReader::open(&pair.left_image_path)?;
-        let reader_r = GeoTiffReader::open(&pair.right_image_path)?;
-        let plan = plan_full_model(
-            chantier,
-            pair,
-            reader_l.meta.width,
-            reader_l.meta.height,
-            reader_r.meta.width,
-            reader_r.meta.height,
-            p.roi_size,
-        )?;
-
-        let model_ply_path = out_dir.join(format!("{}-FULL-PC.ply", pair.name));
-        // For single-model runs (or non-express multi-pair), write per-model dense RGB f64 PLY
-        let write_model_ply = !global_merge || !p.express;
-        let mut model_merger = if write_model_ply {
-            Some(PointCloudMerger::new(&model_ply_path, p.merge_voxel)?)
-        } else {
-            None
-        };
-
-        let overlap_mpx = (plan.overlap_w as f64 * plan.overlap_h as f64) / 1_000_000.0;
-        if !p.ndjson {
-            println!(
-                "\n=== Modèle {}/{} : {} (baseline={:.1} m) ===",
-                idx + 1,
-                chantier.pairs.len(),
-                pair.name,
-                pair.baseline_m
-            );
-            println!("  Left         : {} ({}x{} px)", pair.left_image_path.display(), plan.full_dims_l.0, plan.full_dims_l.1);
-            println!("  Right        : {} ({}x{} px)", pair.right_image_path.display(), plan.full_dims_r.0, plan.full_dims_r.1);
-            let area_str = match plan.validated_overlap_area_m2 {
-                Some(a) => format!(" | Surface validée={:.2} ha", a / 10_000.0),
-                None => String::new(),
-            };
-            println!(
-                "  Recouvrement : {}x{} px ({:.1} Mpx 1:1) | Grille {}x{} = {} dalles ({} bandes source) | Z_ref={:.2} m{}",
-                plan.overlap_w,
-                plan.overlap_h,
-                overlap_mpx,
-                plan.tiles_x,
-                plan.tiles_y,
-                plan.total_tiles,
-                plan.bands.len(),
-                plan.ground_z_ref,
-                area_str
-            );
-            if let Some((n_gcp, dy_rmse, dy_max)) = pair_gcp_epipolar_dy(&chantier.calibration, pair, &chantier.gcp_picks) {
-                println!(
-                    "  Épipolaire   : {} GCP pointés communs | dy RMSE={:.3} px (max={:.3} px)",
-                    n_gcp, dy_rmse, dy_max
-                );
-            }
-            if write_model_ply {
-                println!("  Nuage Modèle : {}", model_ply_path.display());
-            }
-        }
-
-        let mut band_io_ms = 0.0f64;
-        let mut rect_ms = 0.0f64;
-        let mut pprc_ms = 0.0f64;
-        let mut corr_ms = 0.0f64;
-        let mut rfne_ms = 0.0f64;
-        let mut fltr_ms = 0.0f64;
-        let mut tri_ms = 0.0f64;
-        let mut ply_ms = 0.0f64;
-        let mut total_vk_dispatches = 0usize;
-        let mut tiles_done = 0usize;
-        let mut tiles_skipped = 0usize;
-        let mut model_core_px = 0u64;
-        let mut model_pts = 0usize;
-        let mut sum_valid_pct = 0.0f64;
-        let mut prev_median_dx = 0i32;
-
-        for (b_idx, band) in plan.bands.iter().enumerate() {
-            let t_band = std::time::Instant::now();
-            let band_l = load_source_band_for_tiles(
-                &reader_l,
-                &plan.full_cam_l,
-                &plan.rect_cam_l,
-                band,
-                true,
-            )?;
-            let band_r = load_source_band_for_tiles(
-                &reader_r,
-                &plan.full_cam_r,
-                &plan.rect_cam_r,
-                band,
-                false,
-            )?;
-            let b_ms = t_band.elapsed().as_secs_f64() * 1000.0;
-            band_io_ms += b_ms;
-
-            if !p.ndjson {
-                let cache_str = match (&band_l, &band_r) {
-                    (Some(bl), Some(br)) => format!(
-                        "bande RAM L={}x{} R={}x{} décodée en {:.0} ms",
-                        bl.gray.width, bl.gray.height, br.gray.width, br.gray.height, b_ms
-                    ),
-                    _ => "streaming direct par dalle".to_string(),
-                };
-                println!(
-                    "  -- Bande {}/{} ({} dalles, {}) --",
-                    b_idx + 1,
-                    plan.bands.len(),
-                    band.len(),
-                    cache_str
-                );
-                let _ = std::io::stdout().flush();
-            }
-
-            for tile in band {
-                let t_tile = std::time::Instant::now();
-                let t_rect = std::time::Instant::now();
-                let prep_opt = rectify_full_model_tile(
-                    &plan,
-                    tile,
-                    &reader_l,
-                    &reader_r,
-                    band_l.as_ref(),
-                    band_r.as_ref(),
-                    prev_median_dx,
-                    chantier.lidar_mnt.as_ref(),
-                    chantier.survey_crs,
-                )?;
-                let r_ms = t_rect.elapsed().as_secs_f64() * 1000.0;
-                rect_ms += r_ms;
-
-                let Some(prep) = prep_opt else {
-                    tiles_skipped += 1;
-                    tiles_done += 1;
-                    continue;
-                };
-
-                let mut tile_settings = p.settings.clone();
-                if !p.custom_search {
-                    tile_settings.search_min_x = prep.search_box.0;
-                    tile_settings.search_min_y = prep.search_box.1;
-                    tile_settings.search_max_x = prep.search_box.2;
-                    tile_settings.search_max_y = prep.search_box.3;
-                }
-
-                let out = engine.run_express_tile(
-                    &prep.left_img,
-                    prep.left_rgb.as_ref(),
-                    &prep.right_img,
-                    &prep.left_cam,
-                    &prep.right_cam,
-                    &tile_settings,
-                );
-                pprc_ms += out.pprc_ms;
-                corr_ms += out.corr_ms;
-                rfne_ms += out.rfne_ms;
-                fltr_ms += out.fltr_ms;
-                tri_ms += out.tri_ms;
-                total_vk_dispatches += out.vk_dispatches;
-
-                if let Some(mdx) = out.median_dx {
-                    if out.valid_pct >= 25.0 {
-                        prev_median_dx = mdx.round() as i32;
-                    }
-                }
-
-                let t_ply = std::time::Instant::now();
-                let mut added_pts = 0usize;
-                if let Some(ref mut m) = model_merger {
-                    added_pts = m.add_point_cloud_rect(
-                        &out.point_cloud,
-                        tile.emit_x0,
-                        tile.emit_y0,
-                        tile.emit_x1,
-                        tile.emit_y1,
-                    )?;
-                }
-                if let Some(ref mut gm) = global_merger {
-                    let g_pts = gm.add_point_cloud_rect(
-                        &out.point_cloud,
-                        tile.emit_x0,
-                        tile.emit_y0,
-                        tile.emit_x1,
-                        tile.emit_y1,
-                    )?;
-                    if !write_model_ply {
-                        added_pts = g_pts;
-                    }
-                }
-                let p_ms = t_ply.elapsed().as_secs_f64() * 1000.0;
-                ply_ms += p_ms;
-
-                tiles_done += 1;
-                let core_px = (tile.emit_x1 - tile.emit_x0) as u64 * (tile.emit_y1 - tile.emit_y0) as u64;
-                model_core_px += core_px;
-                model_pts += added_pts;
-                sum_valid_pct += out.valid_pct;
-
-                if !p.ndjson {
-                    let elapsed_s = t_model.elapsed().as_secs_f64();
-                    let mpx_s = (model_core_px as f64 / 1_000_000.0) / elapsed_s.max(1e-6);
-                    let remaining = plan.total_tiles.saturating_sub(tiles_done);
-                    let eta_s = if tiles_done > 0 {
-                        (elapsed_s / tiles_done as f64) * remaining as f64
-                    } else {
-                        0.0
-                    };
-                    let tile_s = t_tile.elapsed().as_secs_f64();
-                    println!(
-                        "    [{:>3}/{}] ({:>2},{:>2}) {:>4}x{:<4} dx={:+4} -> {:>7} pts ({:>5.1}%) | {:.2}s [rect={:.0} pprc={:.0} corr={:.0} fltr={:.0} tri={:.0} ply={:.0} ms] | {:.2} Mpx/s | ETA {:.0}s",
-                        tiles_done,
-                        plan.total_tiles,
-                        tile.tx,
-                        tile.ty,
-                        tile.tw,
-                        tile.th,
-                        prep.coarse_dx_px,
-                        added_pts,
-                        out.valid_pct,
-                        tile_s,
-                        r_ms,
-                        out.pprc_ms,
-                        out.corr_ms,
-                        out.fltr_ms,
-                        out.tri_ms,
-                        p_ms,
-                        mpx_s,
-                        eta_s
-                    );
-                    let _ = std::io::stdout().flush();
-                }
-            }
-        }
-
-        let model_stats = if let Some(m) = model_merger {
-            Some(m.finish()?)
-        } else {
-            None
-        };
-
-        let elapsed_s = t_model.elapsed().as_secs_f64();
-        let active_tiles = tiles_done.saturating_sub(tiles_skipped).max(1);
-        let avg_valid = sum_valid_pct / active_tiles as f64;
-        let avg_tile_ms = (elapsed_s * 1000.0) / active_tiles as f64;
-        let mpx_total = model_core_px as f64 / 1_000_000.0;
-        let mpx_s = mpx_total / elapsed_s.max(1e-6);
-        let pts_s = model_pts as f64 / elapsed_s.max(1e-6);
-
-        global_tiles_done += active_tiles;
-        global_core_pixels += model_core_px;
-        global_points += model_pts;
-
-        if !p.ndjson {
-            let total_ms = (elapsed_s * 1000.0).max(1e-6);
-            println!("\n=== Bilan Express Modèle {} ===", pair.name);
-            println!(
-                "  Dalles 1:1       : {} traitées ({} ignorées hors capteur) | {:.1} Mpx utiles",
-                active_tiles, tiles_skipped, mpx_total
-            );
-            println!(
-                "  Vitesse Pipeline : {:.2} s total | {:.0} ms/dalle | {:.2} Mpx/s | {:.2} Mpts/s",
-                elapsed_s,
-                avg_tile_ms,
-                mpx_s,
-                pts_s / 1_000_000.0
-            );
-            println!(
-                "  Ventilation      : GeoTIFF={:.1}s ({:.1}%) | Rect={:.1}s ({:.1}%) | PPRC={:.1}s ({:.1}%) | Corr/SGM={:.1}s ({:.1}%) | Rfne={:.1}s ({:.1}%) | Fltr={:.1}s ({:.1}%) | Tri={:.1}s ({:.1}%) | PLY={:.1}s ({:.1}%)",
-                band_io_ms / 1000.0, 100.0 * band_io_ms / total_ms,
-                rect_ms / 1000.0, 100.0 * rect_ms / total_ms,
-                pprc_ms / 1000.0, 100.0 * pprc_ms / total_ms,
-                corr_ms / 1000.0, 100.0 * corr_ms / total_ms,
-                rfne_ms / 1000.0, 100.0 * rfne_ms / total_ms,
-                fltr_ms / 1000.0, 100.0 * fltr_ms / total_ms,
-                tri_ms / 1000.0, 100.0 * tri_ms / total_ms,
-                ply_ms / 1000.0, 100.0 * ply_ms / total_ms,
-            );
-            println!(
-                "  Qualité / GPU    : densité moy. {:.2}% | {} dispatches Vulkan",
-                avg_valid, total_vk_dispatches
-            );
-            if let Some(ref st) = model_stats {
-                println!(
-                    "  Nuage Dense RGB  : {} ({} pts, {:.1} MB)",
-                    model_ply_path.display(),
-                    st.vertex_count,
-                    st.file_size_bytes as f64 / (1024.0 * 1024.0)
-                );
-                println!(
-                    "  Emprise 3D       : X=[{:.2}..{:.2}] Y=[{:.2}..{:.2}] Z=[{:.2}..{:.2}] m",
-                    st.min_x, st.max_x, st.min_y, st.max_y, st.min_z, st.max_z
-                );
-            }
-        }
-    }
-
-    if let Some(gm) = global_merger {
-        let st = gm.finish()?;
-        let elapsed_s = t_global.elapsed().as_secs_f64();
-        if !p.ndjson {
-            println!(
-                "\n=== Chantier Global Full-Model Terminé ({} modèles, {} dalles, {:.1} s) ===",
-                selected.len(),
-                global_tiles_done,
-                elapsed_s
-            );
-            println!(
-                "  Débit Global     : {:.2} Mpx/s ({:.1} Mpx, {} pts générés)",
-                (global_core_pixels as f64 / 1_000_000.0) / elapsed_s.max(1e-6),
-                global_core_pixels as f64 / 1_000_000.0,
-                global_points
-            );
-            println!(
-                "  Nuage Global RGB : {} ({} pts, {:.1} MB)",
-                global_ply_path.display(),
-                st.vertex_count,
-                st.file_size_bytes as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "  Emprise 3D       : X=[{:.2}..{:.2}] Y=[{:.2}..{:.2}] Z=[{:.2}..{:.2}] m",
-                st.min_x, st.max_x, st.min_y, st.max_y, st.min_z, st.max_z
-            );
-        }
-    }
-
     Ok(())
 }
 

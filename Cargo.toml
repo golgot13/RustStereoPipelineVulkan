@@ -2,7 +2,7 @@
 name = "rust-stereo-pipeline-vulkan"
 version = "0.2.0"
 edition = "2021"
-description = "Rust + Vulkan Compute recode of the Ames Stereo Pipeline with CLI, egui Studio, Native X11, and Web UI"
+description = "100% Zero-Dependency Pure-Rust + Vulkan Compute Aerial Stereo Photogrammetry Pipeline with Real-Time 2D/3D Web Workstation & LAS/LAZ/COPC LiDAR HD Engine"
 license = "Apache-2.0"
 
 [lib]
@@ -13,17 +13,7 @@ path = "src/lib.rs"
 name = "stereo-pipeline"
 path = "src/main.rs"
 
-[features]
-default = ["egui-ui", "laz-lidar"]
-# Optional egui/eframe desktop UI; compile with `--no-default-features` for 100% zero external crates
-egui-ui = ["dep:eframe"]
-# Optional pure-Rust LAS/LAZ/COPC LiDAR HD reader for IGN_DATA local MNT/MNS terrain guidance
-laz-lidar = ["dep:las", "dep:laz"]
-
 [dependencies]
-eframe = { version = "0.31", optional = true }
-las = { version = "0.9", features = ["laz"], optional = true }
-laz = { version = "0.12", optional = true }
 
 [profile.release]
 opt-level = 3

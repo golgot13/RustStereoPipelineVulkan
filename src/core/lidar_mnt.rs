@@ -14,10 +14,13 @@ use std::path::{Path, PathBuf};
 
 use crate::core::crs::{transform_point, CrsId};
 use crate::core::error::Result;
+use crate::core::las_laz::{
+    decode_layered_chunk_xyz_cls, decode_laz_chunk_xyz_cls, read_chunk_table, LasHeader, LasVlr,
+    LazVlr,
+};
 use crate::math::Vec3;
 
 const CACHE_MAGIC: &[u8; 8] = b"RSPVMNT2";
-#[cfg(feature = "laz-lidar")]
 const DEFAULT_CELL_SIZE_M: f64 = 4.0;
 
 /// Compact local MNT (Ground, class 2) + MNS (Surface, all returns) grid built from IGN LiDAR HD `.laz` tiles.
@@ -281,7 +284,6 @@ pub fn find_ign_data_dir(chantier_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-#[cfg(feature = "laz-lidar")]
 fn collect_laz_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
@@ -300,7 +302,6 @@ fn collect_laz_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[cfg(feature = "laz-lidar")]
 fn fingerprint_files(files: &[PathBuf], cell_size: f64) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mix = |h: &mut u64, bytes: &[u8]| {
@@ -321,7 +322,6 @@ fn fingerprint_files(files: &[PathBuf], cell_size: f64) -> u64 {
     h
 }
 
-#[cfg(feature = "laz-lidar")]
 fn fill_small_gaps(grid: &mut [f32], w: usize, h: usize, passes: usize) {
     for _ in 0..passes {
         let prev = grid.to_vec();
@@ -360,13 +360,6 @@ fn fill_small_gaps(grid: &mut [f32], w: usize, h: usize, passes: usize) {
     }
 }
 
-#[cfg(feature = "laz-lidar")]
-fn vlr_user_id_str(bytes: &[u8; 16]) -> &str {
-    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    std::str::from_utf8(&bytes[..len]).unwrap_or("")
-}
-
-#[cfg(feature = "laz-lidar")]
 struct TileAccum {
     ox: usize,
     oy: usize,
@@ -389,25 +382,13 @@ struct TileAccum {
     points_used: usize,
 }
 
-#[cfg(feature = "laz-lidar")]
 impl TileAccum {
     #[inline(always)]
-    fn push_record(&mut self, rec: &[u8]) {
-        if rec.len() < 17 {
-            return;
-        }
-        let cls = if self.is_las14_fmt {
-            rec[16]
-        } else {
-            rec[15] & 0x1F
-        };
+    fn push_raw_xyz_cls(&mut self, rx: i32, ry: i32, rz: i32, cls: u8) {
         // Skip ASPRS Low Noise (7) and High Noise (18)
         if cls == 7 || cls == 18 {
             return;
         }
-        let rx = i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-        let ry = i32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
-        let rz = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
         let x = rx as f64 * self.sx + self.ox_t;
         let y = ry as f64 * self.sy + self.oy_t;
         let z = rz as f64 * self.sz + self.oz_t;
@@ -433,20 +414,33 @@ impl TileAccum {
         }
         self.points_used += 1;
     }
+
+    #[inline(always)]
+    fn push_record(&mut self, rec: &[u8]) {
+        if rec.len() < 17 {
+            return;
+        }
+        let cls = if self.is_las14_fmt {
+            rec[16]
+        } else {
+            rec[15] & 0x1F
+        };
+        let rx = i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+        let ry = i32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+        let rz = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+        self.push_raw_xyz_cls(rx, ry, rz, cls);
+    }
 }
 
-/// Ultra-fast COPC 1.0 octree LOD reader (`level <= 4`, capped at ~450k uniformly spaced points/tile)
-/// using selective LAZ decompression (`XYZ + Classification` only, skipping GPS/RGB/NIR/Intensity).
-#[cfg(feature = "laz-lidar")]
+/// Ultra-fast zero-dependency COPC 1.0 octree LOD reader (`level <= 4`, capped at ~450k points/tile)
+/// using selective zero-copy LAZ v3 layered decompression (`XYZ + Classification` only).
 fn rasterize_copc_lod(
     file: &mut File,
     copc_vlr_data: &[u8],
-    laz_vlr: &laz::LazVlr,
+    laz_vlr: &LazVlr,
     accum: &mut TileAccum,
 ) -> bool {
-    use laz::record::{LayeredPointRecordDecompressor, RecordDecompressor};
-    use laz::DecompressionSelection;
-    use std::io::{Cursor, Seek, SeekFrom};
+    use std::io::{Seek, SeekFrom};
 
     // COPC 1.0 Info VLR layout (160 bytes):
     // 0..40: center(3*f64), halfsize(f64), spacing(f64)
@@ -513,14 +507,6 @@ fn rasterize_copc_lod(
     // Process breadth-first (level 0, 1, 2, 3, 4) and sequential by file offset within each level
     nodes.sort_by_key(|n| (n.level, n.offset));
 
-    let sel = DecompressionSelection(
-        DecompressionSelection::Z | DecompressionSelection::CLASSIFICATION,
-    );
-    let rec_size = laz_vlr.items_size() as usize;
-    if rec_size < 17 {
-        return false;
-    }
-    let mut rec_buf = vec![0u8; rec_size];
     let mut comp_buf = Vec::new();
     let max_pts_per_tile = 450_000usize;
     let mut total_decoded = 0usize;
@@ -539,88 +525,64 @@ fn rasterize_copc_lod(
         if file.read_exact(&mut comp_buf).is_err() {
             continue;
         }
-        let mut dec = LayeredPointRecordDecompressor::new(Cursor::new(comp_buf.as_slice()));
-        if dec.set_fields_from(laz_vlr.items()).is_err() {
-            return false;
-        }
-        dec.set_selection(sel);
-        for _ in 0..node.point_count {
-            if dec.decompress_next(&mut rec_buf).is_err() {
-                break;
-            }
-            accum.push_record(&rec_buf);
-            total_decoded += 1;
+        match decode_layered_chunk_xyz_cls(&comp_buf, laz_vlr, node.point_count, |rx, ry, rz, cls| {
+            accum.push_raw_xyz_cls(rx, ry, rz, cls);
+        }) {
+            Ok(n) => total_decoded += n,
+            Err(_) => return false,
         }
     }
 
     accum.points_used > 0
 }
 
-/// Fast selective chunk-strided LAZ reader for non-COPC `.laz` files (`XYZ + Classification` only).
-#[cfg(feature = "laz-lidar")]
+/// Fast zero-dependency selective chunk-strided LAZ reader for non-COPC `.laz` files (`XYZ + Classification`).
 fn rasterize_laz_selective(
     mut file: File,
     point_data_offset: u64,
     total_pts: u64,
-    laz_vlr: laz::LazVlr,
+    laz_vlr: &LazVlr,
     accum: &mut TileAccum,
 ) -> bool {
-    use laz::{DecompressionSelection, LasZipDecompressor};
     use std::io::{Seek, SeekFrom};
 
-    if file.seek(SeekFrom::Start(point_data_offset)).is_err() {
-        return false;
-    }
-    let sel = DecompressionSelection(
-        DecompressionSelection::Z | DecompressionSelection::CLASSIFICATION,
-    );
-    let rec_size = laz_vlr.items_size() as usize;
-    if rec_size < 17 {
-        return false;
-    }
-    let fixed_chunk_sz = if !laz_vlr.uses_variable_size_chunks() && laz_vlr.chunk_size() > 0 {
-        Some(laz_vlr.chunk_size() as u64)
-    } else {
-        None
-    };
-
-    let reader = BufReader::with_capacity(256 * 1024, file);
-    let Ok(mut dec) = LasZipDecompressor::selective(reader, laz_vlr, sel) else {
+    let Ok(chunks) = read_chunk_table(&mut file, point_data_offset, laz_vlr, total_pts) else {
         return false;
     };
-    let mut rec_buf = vec![0u8; rec_size];
-    let target_pts = 450_000u64;
+    if chunks.is_empty() {
+        return false;
+    }
 
-    if let Some(cs) = fixed_chunk_sz.filter(|_| total_pts > target_pts) {
-        let n_chunks = (total_pts + cs - 1) / cs;
-        let pts_per_chunk = (target_pts / n_chunks.max(1)).clamp(512, cs);
-        for c in 0..n_chunks {
-            if c > 0 && dec.seek(c * cs).is_err() {
-                break;
-            }
-            let n_read = pts_per_chunk.min(total_pts.saturating_sub(c * cs));
-            for _ in 0..n_read {
-                if dec.decompress_one(&mut rec_buf).is_err() {
-                    break;
-                }
-                accum.push_record(&rec_buf);
-            }
-        }
+    let target_pts = 450_000usize;
+    let n_chunks = chunks.len();
+    let per_chunk_budget = if total_pts as usize > target_pts {
+        (target_pts / n_chunks.max(1)).clamp(512, 50_000)
     } else {
-        let n_read = total_pts.min(600_000);
-        for _ in 0..n_read {
-            if dec.decompress_one(&mut rec_buf).is_err() {
-                break;
-            }
-            accum.push_record(&rec_buf);
+        usize::MAX
+    };
+
+    let mut comp_buf = Vec::new();
+    for ch in chunks {
+        if ch.byte_count == 0 || ch.byte_count > 64 * 1024 * 1024 || ch.point_count == 0 {
+            continue;
         }
+        if file.seek(SeekFrom::Start(ch.file_offset)).is_err() {
+            break;
+        }
+        comp_buf.resize(ch.byte_count as usize, 0u8);
+        if file.read_exact(&mut comp_buf).is_err() {
+            break;
+        }
+        let max_pts = (ch.point_count as usize).min(per_chunk_budget);
+        let _ = decode_laz_chunk_xyz_cls(&comp_buf, laz_vlr, max_pts, |rx, ry, rz, cls| {
+            accum.push_raw_xyz_cls(rx, ry, rz, cls);
+        });
     }
 
     accum.points_used > 0
 }
 
 /// Fast strided raw reader for uncompressed `.las` files.
-#[cfg(feature = "laz-lidar")]
 fn rasterize_las_raw(
     mut file: File,
     point_data_offset: u64,
@@ -659,14 +621,12 @@ fn rasterize_las_raw(
 
 /// Load or build a compact `4.0 m` MNT + MNS `LidarTerrainModel` from `.laz`/`.las` files in `ign_dir`,
 /// intersecting the survey bounding box `(survey_min_x..survey_max_x, survey_min_y..survey_max_y)` in `survey_crs`.
-#[cfg(feature = "laz-lidar")]
 pub fn load_ign_lidar_mnt(
     ign_dir: &Path,
     cache_path: Option<&Path>,
     survey_bbox: (f64, f64, f64, f64),
     survey_crs: CrsId,
 ) -> Result<Option<LidarTerrainModel>> {
-    use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let t_start = std::time::Instant::now();
@@ -690,7 +650,7 @@ pub fn load_ign_lidar_mnt(
         let Ok(mut f) = File::open(path) else {
             continue;
         };
-        let Ok(raw_hdr) = las::raw::Header::read_from(&mut f) else {
+        let Ok(raw_hdr) = LasHeader::read_from(&mut f) else {
             continue;
         };
         if !raw_hdr.min_x.is_finite()
@@ -832,29 +792,26 @@ pub fn load_ign_lidar_mnt(
                     let Ok(mut file) = File::open(&info.path) else {
                         continue;
                     };
-                    let Ok(raw_hdr) = las::raw::Header::read_from(&mut file) else {
+                    let Ok(raw_hdr) = LasHeader::read_from(&mut file) else {
                         continue;
                     };
                     let mut copc_vlr_data: Option<Vec<u8>> = None;
-                    let mut laz_vlr: Option<laz::LazVlr> = None;
-                    for _ in 0..raw_hdr.number_of_variable_length_records {
-                        let Ok(vlr) = las::raw::Vlr::read_from(&mut file, false) else {
+                    let mut laz_vlr: Option<LazVlr> = None;
+                    for _ in 0..raw_hdr.number_of_vlrs {
+                        let Ok(vlr) = LasVlr::read_from(&mut file) else {
                             break;
                         };
-                        let uid = vlr_user_id_str(&vlr.user_id);
+                        let uid = vlr.user_id_str();
                         if uid.eq_ignore_ascii_case("copc") && vlr.record_id == 1 {
                             copc_vlr_data = Some(vlr.data);
                         } else if uid.eq_ignore_ascii_case("laszip encoded") && vlr.record_id == 22204 {
-                            laz_vlr = laz::LazVlr::read_from(Cursor::new(&vlr.data)).ok();
+                            laz_vlr = LazVlr::parse(&vlr.data).ok();
                         }
                     }
 
-                    let is_compressed = (raw_hdr.point_data_record_format & 0x80) != 0;
-                    let fmt_id = raw_hdr.point_data_record_format & 0x3F;
-                    let total_pts = raw_hdr
-                        .large_file
-                        .map(|lf| lf.number_of_point_records)
-                        .unwrap_or(raw_hdr.number_of_point_records as u64);
+                    let is_compressed = raw_hdr.is_compressed();
+                    let fmt_id = raw_hdr.point_format_id();
+                    let total_pts = raw_hdr.total_points();
 
                     let mut accum = TileAccum {
                         ox: tx0,
@@ -880,10 +837,10 @@ pub fn load_ign_lidar_mnt(
 
                     let mut mode_label = "LAS";
                     if is_compressed {
-                        if let Some(lv) = laz_vlr {
+                        if let Some(ref lv) = laz_vlr {
                             let copc_ok = copc_vlr_data
                                 .as_deref()
-                                .map_or(false, |cd| rasterize_copc_lod(&mut file, cd, &lv, &mut accum));
+                                .map_or(false, |cd| rasterize_copc_lod(&mut file, cd, lv, &mut accum));
                             if copc_ok {
                                 mode_label = "COPC LOD";
                             } else {
@@ -1017,16 +974,6 @@ pub fn load_ign_lidar_mnt(
     Ok(Some(model))
 }
 
-#[cfg(not(feature = "laz-lidar"))]
-pub fn load_ign_lidar_mnt(
-    _ign_dir: &Path,
-    _cache_path: Option<&Path>,
-    _survey_bbox: (f64, f64, f64, f64),
-    _survey_crs: CrsId,
-) -> Result<Option<LidarTerrainModel>> {
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,70 +1043,70 @@ mod tests {
         assert!((z_loaded - z_g).abs() < 1e-4);
     }
 
-    #[cfg(feature = "laz-lidar")]
     #[test]
-    fn test_laz_v14_selective_decompression_end_to_end() {
-        use las::point::Classification;
-        use las::{Builder, Point, Version, Writer};
-
-        let test_dir = std::env::temp_dir().join("rspv_test_ign_laz_e2e");
+    fn test_las_v14_mnt_mns_end_to_end_zero_dep() {
+        let test_dir = std::env::temp_dir().join("rspv_test_ign_las_zero_dep");
         let _ = std::fs::remove_dir_all(&test_dir);
         std::fs::create_dir_all(&test_dir).unwrap();
-        let laz_path = test_dir.join("LHD_FXX_0899_6268_TEST.laz");
+        let las_path = test_dir.join("LHD_FXX_0899_6268_TEST.las");
         let cache_path = test_dir.join("mnt_cache.bin");
 
-        // Build a real LAS 1.4 PDRF 6 compressed .laz tile (exact IGN LiDAR HD point format!)
-        let mut builder = Builder::from((1, 4));
-        builder.version = Version::new(1, 4);
-        builder.point_format = las::point::Format::new(6).unwrap();
-        builder.point_format.is_compressed = true;
-        builder.transforms.x.scale = 0.001;
-        builder.transforms.y.scale = 0.001;
-        builder.transforms.z.scale = 0.001;
-        builder.transforms.x.offset = 899_000.0;
-        builder.transforms.y.offset = 6_268_000.0;
-        builder.transforms.z.offset = 0.0;
-        let header = builder.into_header().unwrap();
-        {
-            let mut writer = Writer::from_path(&laz_path, header).unwrap();
-            for iy in 0..30 {
-                for ix in 0..30 {
-                    let x = 899_000.0 + ix as f64 * 4.0 + 1.0;
-                    let y = 6_268_000.0 + iy as f64 * 4.0 + 1.0;
-                    let z_ground = 240.0 + 0.05 * (x - 899_000.0);
-                    // Class 2 Ground point
-                    let mut pg = Point::default();
-                    pg.x = x;
-                    pg.y = y;
-                    pg.z = z_ground;
-                    pg.gps_time = Some(1234.5);
-                    pg.classification = Classification::Ground;
-                    writer.write_point(pg).unwrap();
-                    // Class 6 Building roof (+10 m above ground)
-                    let mut pb = Point::default();
-                    pb.x = x;
-                    pb.y = y;
-                    pb.z = z_ground + 10.0;
-                    pb.gps_time = Some(1234.6);
-                    pb.classification = Classification::Building;
-                    writer.write_point(pb).unwrap();
-                    // Class 7 Low Noise (-100 m outlier, must be rejected!)
-                    let mut pn = Point::default();
-                    pn.x = x;
-                    pn.y = y;
-                    pn.z = z_ground - 100.0;
-                    pn.gps_time = Some(1234.7);
-                    pn.classification = Classification::LowPoint;
-                    writer.write_point(pn).unwrap();
-                }
+        // Write a valid LAS 1.4 PDRF 6 file directly in pure Rust (375-byte header + 30-byte records)
+        let n_pts: u64 = 30 * 30 * 3;
+        let mut hdr = vec![0u8; 375];
+        hdr[0..4].copy_from_slice(b"LASF");
+        hdr[24] = 1; // major
+        hdr[25] = 4; // minor
+        hdr[94..96].copy_from_slice(&375u16.to_le_bytes()); // header_size
+        hdr[96..100].copy_from_slice(&375u32.to_le_bytes()); // offset_to_point_data
+        hdr[100..104].copy_from_slice(&0u32.to_le_bytes()); // number_of_vlrs
+        hdr[104] = 6; // PDRF 6 (uncompressed)
+        hdr[105..107].copy_from_slice(&30u16.to_le_bytes()); // record length
+        hdr[107..111].copy_from_slice(&(n_pts as u32).to_le_bytes());
+        hdr[131..139].copy_from_slice(&0.001f64.to_le_bytes()); // x_scale
+        hdr[139..147].copy_from_slice(&0.001f64.to_le_bytes()); // y_scale
+        hdr[147..155].copy_from_slice(&0.001f64.to_le_bytes()); // z_scale
+        hdr[155..163].copy_from_slice(&899_000.0f64.to_le_bytes()); // x_offset
+        hdr[163..171].copy_from_slice(&6_268_000.0f64.to_le_bytes()); // y_offset
+        hdr[171..179].copy_from_slice(&0.0f64.to_le_bytes()); // z_offset
+        hdr[179..187].copy_from_slice(&899_120.0f64.to_le_bytes()); // max_x
+        hdr[187..195].copy_from_slice(&899_000.0f64.to_le_bytes()); // min_x
+        hdr[195..203].copy_from_slice(&6_268_120.0f64.to_le_bytes()); // max_y
+        hdr[203..211].copy_from_slice(&6_268_000.0f64.to_le_bytes()); // min_y
+        hdr[211..219].copy_from_slice(&260.0f64.to_le_bytes()); // max_z
+        hdr[219..227].copy_from_slice(&140.0f64.to_le_bytes()); // min_z
+        hdr[247..255].copy_from_slice(&n_pts.to_le_bytes()); // extended number of point records
+
+        let mut f = BufWriter::new(File::create(&las_path).unwrap());
+        f.write_all(&hdr).unwrap();
+        let write_pt = |f: &mut BufWriter<File>, x: f64, y: f64, z: f64, cls: u8| {
+            let mut rec = [0u8; 30];
+            let rx = ((x - 899_000.0) / 0.001).round() as i32;
+            let ry = ((y - 6_268_000.0) / 0.001).round() as i32;
+            let rz = (z / 0.001).round() as i32;
+            rec[0..4].copy_from_slice(&rx.to_le_bytes());
+            rec[4..8].copy_from_slice(&ry.to_le_bytes());
+            rec[8..12].copy_from_slice(&rz.to_le_bytes());
+            rec[16] = cls;
+            f.write_all(&rec).unwrap();
+        };
+        for iy in 0..30 {
+            for ix in 0..30 {
+                let x = 899_000.0 + ix as f64 * 4.0 + 1.0;
+                let y = 6_268_000.0 + iy as f64 * 4.0 + 1.0;
+                let z_ground = 240.0 + 0.05 * (x - 899_000.0);
+                write_pt(&mut f, x, y, z_ground, 2); // Ground
+                write_pt(&mut f, x, y, z_ground + 10.0, 6); // Building (+10m)
+                write_pt(&mut f, x, y, z_ground - 100.0, 7); // Low Noise (-100m, must be rejected!)
             }
-            writer.close().unwrap();
         }
+        f.flush().unwrap();
+        drop(f);
 
         let bbox = (899_000.0, 899_120.0, 6_268_000.0, 6_268_120.0);
         let mnt = load_ign_lidar_mnt(&test_dir, Some(&cache_path), bbox, CrsId::Lambert93)
             .unwrap()
-            .expect("expected LidarTerrainModel from .laz");
+            .expect("expected LidarTerrainModel from .las");
         assert!(!mnt.from_cache);
         assert_eq!(mnt.lidar_crs, CrsId::Lambert93);
 

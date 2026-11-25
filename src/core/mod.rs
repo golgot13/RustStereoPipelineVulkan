@@ -4,9 +4,11 @@
 pub mod cancel;
 pub mod chantier;
 pub mod chantier_calib;
+pub mod chantier_runner;
 pub mod crs;
 pub mod error;
 pub mod hardware;
 pub mod job;
 pub mod json;
+pub mod las_laz;
 pub mod lidar_mnt;
