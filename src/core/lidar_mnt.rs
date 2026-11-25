@@ -16,7 +16,7 @@ use crate::core::crs::{transform_point, CrsId};
 use crate::core::error::Result;
 use crate::math::Vec3;
 
-const CACHE_MAGIC: &[u8; 8] = b"RSPVMNT1";
+const CACHE_MAGIC: &[u8; 8] = b"RSPVMNT2";
 #[cfg(feature = "laz-lidar")]
 const DEFAULT_CELL_SIZE_M: f64 = 4.0;
 
@@ -138,14 +138,13 @@ impl LidarTerrainModel {
             return None;
         }
         let mut z = fallback_z;
-        let mut last_pt = None;
+        let mut last_hit_pt = None;
         for _ in 0..8 {
             let t = (z - origin.z) / ray.z;
             if t <= 0.0 || !t.is_finite() {
                 return None;
             }
             let pt = origin + ray * t;
-            last_pt = Some(pt);
             let z_dem = if use_ground {
                 self.sample_ground_z(pt.x, pt.y, survey_crs)
             } else {
@@ -153,17 +152,20 @@ impl LidarTerrainModel {
             };
             match z_dem {
                 Some(zn) => {
+                    let tf = (zn - origin.z) / ray.z;
+                    if tf > 0.0 && tf.is_finite() {
+                        last_hit_pt = Some(origin + ray * tf);
+                    }
                     if (zn - z).abs() < 0.01 {
-                        let tf = (zn - origin.z) / ray.z;
-                        return Some(origin + ray * tf);
+                        return last_hit_pt;
                     }
                     // Damped fixed-point step guarantees monotonic convergence even on steep cliffs
                     z = 0.75 * zn + 0.25 * z;
                 }
-                None => return last_pt,
+                None => return last_hit_pt,
             }
         }
-        last_pt
+        last_hit_pt
     }
 
     /// Save compact binary MNT/MNS cache to disk (keyed by fingerprint of source `.laz` tiles).
@@ -446,11 +448,14 @@ fn rasterize_copc_lod(
     use laz::DecompressionSelection;
     use std::io::{Cursor, Seek, SeekFrom};
 
-    if copc_vlr_data.len() < 152 {
+    // COPC 1.0 Info VLR layout (160 bytes):
+    // 0..40: center(3*f64), halfsize(f64), spacing(f64)
+    // 40..48: root_hier_offset (u64), 48..56: root_hier_size (u64)
+    if copc_vlr_data.len() < 56 {
         return false;
     }
-    let root_hier_offset = u64::from_le_bytes(copc_vlr_data[136..144].try_into().unwrap());
-    let root_hier_size = u64::from_le_bytes(copc_vlr_data[144..152].try_into().unwrap());
+    let root_hier_offset = u64::from_le_bytes(copc_vlr_data[40..48].try_into().unwrap());
+    let root_hier_size = u64::from_le_bytes(copc_vlr_data[48..56].try_into().unwrap());
     if root_hier_size < 32 || root_hier_size > 16 * 1024 * 1024 {
         return false;
     }
@@ -714,9 +719,9 @@ pub fn load_ign_lidar_mnt(
     }
     let lidar_crs = detected_lidar_crs.unwrap_or(survey_crs);
 
-    // Transform survey bbox (+ 900 m margin covering full DMC-IV half-footprint) into lidar_crs
+    // Transform survey bbox (+ 1100 m margin covering full DMC-IV half-footprint + oblique corners) into lidar_crs
     let (sx0, sx1, sy0, sy1) = survey_bbox;
-    let margin = 900.0;
+    let margin = 1100.0;
     let survey_corners = [
         Vec3::new(sx0 - margin, sy0 - margin, 0.0),
         Vec3::new(sx1 + margin, sy0 - margin, 0.0),
@@ -1075,6 +1080,10 @@ mod tests {
         let ray = (target - cam_c).normalized();
         let hit = mnt.intersect_ray_ground(cam_c, ray, 200.0, CrsId::CcZone(44)).unwrap();
         assert!((hit - target).norm() < 0.1, "ray-MNT hit error: {}", (hit - target).norm());
+
+        // Ray landing far outside MNT grid MUST return None (never silently lock onto fallback_z!)
+        let far_cam = Vec3::new(cc44_pt.x + 50_000.0, cc44_pt.y + 50_000.0, 2000.0);
+        assert!(mnt.intersect_ray_ground(far_cam, Vec3::new(0.0, 0.0, -1.0), 200.0, CrsId::CcZone(44)).is_none());
 
         // Cache save/load roundtrip
         let cache_p = std::env::temp_dir().join("rspv_test_lidar_mnt_cache.bin");

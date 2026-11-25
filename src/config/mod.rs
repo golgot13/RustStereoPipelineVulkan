@@ -206,8 +206,8 @@ impl Default for StereoSettings {
             search_max_x: 48,
             search_min_y: -2,
             search_max_y: 2,
-            sgm_p1: 0.12,
-            sgm_p2: 0.48,
+            sgm_p1: 0.22,
+            sgm_p2: 0.85,
             lr_threshold: 2.0,
             pyramid_levels: 3,
 

@@ -5,7 +5,7 @@
 //! - Mode 2: Bayes-EM robust weighted Lucas-Kanade / Affine Gauss-Newton refinement
 //! - Mode 3: Affine Gauss-Newton subpixel refinement
 
-use crate::config::{StereoSettings, SubpixelMode};
+use crate::config::{CostMode, StereoSettings, SubpixelMode};
 use crate::image::{DisparityMap, ImageF32};
 use crate::pipeline::corr::patch_cost;
 
@@ -15,22 +15,30 @@ pub fn run_rfne(
     disp_in: &DisparityMap,
     settings: &StereoSettings,
 ) -> DisparityMap {
+    run_rfne_with_raw(left, right, left, right, disp_in, settings)
+}
+
+/// Subpixel refinement using clean raw radiometric images for continuous ZNCC parabola fitting
+/// (eliminates discrete Census Hamming quantization noise on flat surfaces while keeping SGM integer accuracy).
+pub fn run_rfne_with_raw(
+    left_pprc: &ImageF32,
+    right_pprc: &ImageF32,
+    left_raw: &ImageF32,
+    right_raw: &ImageF32,
+    disp_in: &DisparityMap,
+    settings: &StereoSettings,
+) -> DisparityMap {
     match settings.subpixel_mode {
         SubpixelMode::None => disp_in.clone(),
-        SubpixelMode::Parabola => {
-            if disp_in.is_subpixel {
-                disp_in.clone()
-            } else {
-                refine_parabola(left, right, disp_in, settings)
-            }
-        }
-        SubpixelMode::Affine => refine_lucas_kanade(left, right, disp_in, settings, false),
-        SubpixelMode::BayesEmAffine => refine_lucas_kanade(left, right, disp_in, settings, true),
+        SubpixelMode::Parabola => refine_parabola_pure_zncc(left_raw, right_raw, disp_in, settings),
+        SubpixelMode::Affine => refine_lucas_kanade(left_pprc, right_pprc, disp_in, settings, false),
+        SubpixelMode::BayesEmAffine => refine_lucas_kanade(left_pprc, right_pprc, disp_in, settings, true),
     }
 }
 
-/// Quadratic parabola fitting around integer disparity `(dx, dy)` in both X and Y.
-fn refine_parabola(
+/// Quadratic parabola fitting around integer disparity `(dx, dy)` using pure continuous ZNCC
+/// (zero discrete Census bit-flipping noise) on raw images.
+fn refine_parabola_pure_zncc(
     left: &ImageF32,
     right: &ImageF32,
     disp_in: &DisparityMap,
@@ -42,6 +50,12 @@ fn refine_parabola(
     let hkh = (s.subpixel_kernel_y / 2).clamp(1, 5) as i32;
     let n_threads = s.threads.clamp(1, h.max(1));
     let rows_per = (h + n_threads - 1) / n_threads;
+    // Always use continuous cost (pure ZNCC for Ncc/Census, or native Sad/Ssd) for smooth subpixel peak
+    let sub_cost_mode = match s.cost_mode {
+        CostMode::Sad => CostMode::Sad,
+        CostMode::Ssd => CostMode::Ssd,
+        CostMode::Ncc | CostMode::Census => CostMode::Ncc,
+    };
 
     let mut out = disp_in.clone();
     std::thread::scope(|scope| {
@@ -64,32 +78,31 @@ fn refine_parabola(
                         let d0x = disp_in.dx[idx].round() as i32;
                         let d0y = disp_in.dy[idx].round() as i32;
 
-                        let c0 = patch_cost(left, right, x, y, d0x, d0y, hkw, hkh, s.cost_mode);
-                        let cmx = patch_cost(left, right, x, y, d0x - 1, d0y, hkw, hkh, s.cost_mode);
-                        let cpx = patch_cost(left, right, x, y, d0x + 1, d0y, hkw, hkh, s.cost_mode);
+                        let c0 = patch_cost(left, right, x, y, d0x, d0y, hkw, hkh, sub_cost_mode);
+                        let cmx = patch_cost(left, right, x, y, d0x - 1, d0y, hkw, hkh, sub_cost_mode);
+                        let cpx = patch_cost(left, right, x, y, d0x + 1, d0y, hkw, hkh, sub_cost_mode);
                         let den_x = cmx - 2.0 * c0 + cpx;
-                        // Strictly convex local minimum check prevents concave +/-0.5 stair-stepping
-                        let delta_x = if den_x > 1e-6 && cmx >= c0 && cpx >= c0 {
-                            (0.5 * (cmx - cpx) / den_x).clamp(-0.5, 0.5)
-                        } else {
-                            0.0
-                        };
+                        // Strictly convex continuous ZNCC minimum eliminates Census quantization & pixel-locking
+                        if den_x > 1e-4 && cmx >= c0 && cpx >= c0 {
+                            let delta_x = (0.5 * (cmx - cpx) / den_x).clamp(-0.5, 0.5);
+                            dxc[ly * w + x as usize] = d0x as f32 + delta_x;
+                        } else if !disp_in.is_subpixel {
+                            dxc[ly * w + x as usize] = d0x as f32;
+                        }
 
-                        let delta_y = if s.search_min_y != s.search_max_y {
-                            let cmy = patch_cost(left, right, x, y, d0x, d0y - 1, hkw, hkh, s.cost_mode);
-                            let cpy = patch_cost(left, right, x, y, d0x, d0y + 1, hkw, hkh, s.cost_mode);
+                        if s.search_min_y != s.search_max_y {
+                            let cmy = patch_cost(left, right, x, y, d0x, d0y - 1, hkw, hkh, sub_cost_mode);
+                            let cpy = patch_cost(left, right, x, y, d0x, d0y + 1, hkw, hkh, sub_cost_mode);
                             let den_y = cmy - 2.0 * c0 + cpy;
-                            if den_y > 1e-6 && cmy >= c0 && cpy >= c0 {
-                                (0.5 * (cmy - cpy) / den_y).clamp(-0.5, 0.5)
-                            } else {
-                                0.0
+                            if den_y > 1e-4 && cmy >= c0 && cpy >= c0 {
+                                let delta_y = (0.5 * (cmy - cpy) / den_y).clamp(-0.5, 0.5);
+                                dyc[ly * w + x as usize] = d0y as f32 + delta_y;
+                            } else if !disp_in.is_subpixel {
+                                dyc[ly * w + x as usize] = d0y as f32;
                             }
                         } else {
-                            0.0
-                        };
-
-                        dxc[ly * w + x as usize] = d0x as f32 + delta_x;
-                        dyc[ly * w + x as usize] = d0y as f32 + delta_y;
+                            dyc[ly * w + x as usize] = d0y as f32;
+                        }
                     }
                 }
             });
@@ -133,7 +146,7 @@ fn refine_lucas_kanade(
     let mut out = if disp_in.is_subpixel {
         disp_in.clone()
     } else {
-        refine_parabola(left, right, disp_in, s)
+        refine_parabola_pure_zncc(left, right, disp_in, s)
     };
     let initial = out.clone();
 

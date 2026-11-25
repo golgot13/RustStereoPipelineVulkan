@@ -136,12 +136,12 @@ impl StereoPipelineEngine {
 
         progress("Stage 2/5: stereo_rfne (Subpixel Refinement)", 0.55);
         let t2 = Instant::now();
-        let disp_refined = rfne::run_rfne(&left_pprc, &right_pprc, &disp_raw, settings);
+        let disp_refined = rfne::run_rfne_with_raw(&left_pprc, &right_pprc, left, right, &disp_raw, settings);
         let rfne_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         progress("Stage 3/5: stereo_fltr (Outlier Erosion & Smoothing)", 0.72);
         let t3 = Instant::now();
-        let disp_filtered = fltr::run_fltr(&disp_refined, settings);
+        let disp_filtered = fltr::run_fltr_guided(&disp_refined, Some(left), settings);
         let fltr_ms = t3.elapsed().as_secs_f64() * 1000.0;
 
         progress("Stage 4/5: stereo_tri (3D Ray-Ray Triangulation)", 0.84);
@@ -217,12 +217,12 @@ impl StereoPipelineEngine {
         if used_vk1 { vk_dispatches += 2; }
 
         let t2 = Instant::now();
-        let disp_refined = rfne::run_rfne(&left_pprc, &right_pprc, &disp_raw, settings);
+        let disp_refined = rfne::run_rfne_with_raw(&left_pprc, &right_pprc, left, right, &disp_raw, settings);
         let rfne_ms = t2.elapsed().as_secs_f64() * 1000.0;
         drop(disp_raw);
 
         let t3 = Instant::now();
-        let disp_filtered = fltr::run_fltr(&disp_refined, settings);
+        let disp_filtered = fltr::run_fltr_guided(&disp_refined, Some(left), settings);
         let fltr_ms = t3.elapsed().as_secs_f64() * 1000.0;
         drop(disp_refined);
 

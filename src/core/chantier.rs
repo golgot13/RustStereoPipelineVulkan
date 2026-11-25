@@ -1637,7 +1637,30 @@ pub fn rectify_full_model_tile(
     lidar_mnt: Option<&LidarTerrainModel>,
     survey_crs: CrsId,
 ) -> Result<Option<PreparedFullModelTile>> {
-    let (tile_cam_l, tile_cam_r) = plan.tile_cameras(tile);
+    let (tile_cam_l, mut tile_cam_r) = plan.tile_cameras(tile);
+    let lidar_win = lidar_mnt.and_then(|mnt| {
+        estimate_lidar_tile_disparity_window(
+            &tile_cam_l,
+            &tile_cam_r,
+            tile.tw,
+            tile.th,
+            plan.ground_z_ref,
+            plan.half_span,
+            mnt,
+            survey_crs,
+        )
+    });
+
+    // Shift right tile window onto exact local terrain elevation when |dx_mnt| > 8 px.
+    // Preserves identical 3D ray geometry while centering disparity on 0 (zero border clipping on steep relief).
+    let mut right_shift = 0i32;
+    if let Some((cdx, _, _)) = lidar_win {
+        if cdx.abs() > 8 {
+            right_shift = cdx;
+            tile_cam_r.cu -= right_shift as f64;
+        }
+    }
+
     let has_l = compute_source_bbox_for_rect_cam(
         reader_l.meta.width,
         reader_l.meta.height,
@@ -1647,16 +1670,17 @@ pub fn rectify_full_model_tile(
         tile.th,
     )
     .is_some();
-    let has_r = compute_source_bbox_for_rect_cam(
+    let Some((rx0, ry0, rsw, rsh)) = compute_source_bbox_for_rect_cam(
         reader_r.meta.width,
         reader_r.meta.height,
         &plan.full_cam_r,
         &tile_cam_r,
         tile.tw,
         tile.th,
-    )
-    .is_some();
-    if !has_l || !has_r {
+    ) else {
+        return Ok(None);
+    };
+    if !has_l {
         return Ok(None);
     }
 
@@ -1677,7 +1701,12 @@ pub fn rectify_full_model_tile(
         (img, rgb)
     };
 
-    let right_img = if let Some(br) = band_r {
+    let right_img = if let Some(br) = band_r.filter(|br| {
+        rx0 >= br.x0
+            && ry0 >= br.y0
+            && rx0 + rsw <= br.x0 + br.gray.width
+            && ry0 + rsh <= br.y0 + br.gray.height
+    }) {
         warp_rectified_from_patch(
             &br.gray,
             None,
@@ -1694,19 +1723,8 @@ pub fn rectify_full_model_tile(
     };
 
     // Lock horizontal disparity search window directly onto local IGN LiDAR HD MNT/MNS if available
-    let (coarse_dx, min_x, max_x) = if let Some((cdx, lo, hi)) = lidar_mnt.and_then(|mnt| {
-        estimate_lidar_tile_disparity_window(
-            &tile_cam_l,
-            &tile_cam_r,
-            tile.tw,
-            tile.th,
-            plan.ground_z_ref,
-            plan.half_span,
-            mnt,
-            survey_crs,
-        )
-    }) {
-        (cdx, lo, hi)
+    let (coarse_dx, min_x, max_x) = if let Some((cdx, lo, hi)) = lidar_win {
+        (cdx, lo - right_shift, hi - right_shift)
     } else {
         let cdx = estimate_coarse_epipolar_shift_with_fallback(&left_img, &right_img, 320, fallback_dx);
         (cdx, (cdx - plan.half_span).clamp(-384, 384), (cdx + plan.half_span).clamp(-384, 384))
