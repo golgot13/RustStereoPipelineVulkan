@@ -6,6 +6,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::camera::{AnyCamera, CameraModel, PinholeCamera};
+use crate::core::chantier_calib::{
+    parse_footprints_file, parse_gcp_picks_file, refine_chantier_with_gcp_picks,
+    validate_chantier_footprints, validated_pair_overlap_bounds, FootprintValidationReport,
+    GcpImagePick, GcpRefinementReport, ValidatedFootprint,
+};
 use crate::core::error::{PipelineError, Result};
 use crate::core::json::JsonValue;
 use crate::image::geotiff::GeoTiffReader;
@@ -355,16 +360,33 @@ pub struct Chantier {
     pub camera_file: PathBuf,
     pub trajectory_file: PathBuf,
     pub gcp_file: Option<PathBuf>,
+    pub gcp_picks_file: Option<PathBuf>,
+    pub footprints_file: Option<PathBuf>,
     pub calibration: CameraCalibration,
     pub poses: Vec<ImagePose>,
     pub gcps: Vec<GroundControlPoint>,
+    pub gcp_picks: Vec<GcpImagePick>,
+    pub footprints: HashMap<String, ValidatedFootprint>,
+    pub footprint_report: Option<FootprintValidationReport>,
+    pub ba_report: Option<GcpRefinementReport>,
     pub pairs: Vec<StereoPairEntry>,
 }
 
 impl Chantier {
-    /// Auto-discover `.CAM`, trajectory `.TXT`, optional `GCP*.txt`, and GeoTIFF stereo pairs
-    /// inside `<dir>` (checking `<dir>/input` automatically if present).
+    /// Auto-discover `.CAM`, trajectory `.TXT`, optional `GCP*.txt`, `GCP_picks*.json`,
+    /// `aerophotogram_footprints_validation.json`, and GeoTIFF stereo pairs inside `<dir>`.
     pub fn discover(dir: &Path) -> Result<Self> {
+        Self::discover_with_opts(dir, None, None, true)
+    }
+
+    /// Discover chantier with optional explicit paths for GCP picks JSON & footprints validation JSON
+    /// and toggle for two-stage `f64` LM GCP-pick pose refinement.
+    pub fn discover_with_opts(
+        dir: &Path,
+        gcp_picks_override: Option<&Path>,
+        footprints_override: Option<&Path>,
+        enable_gcp_refine: bool,
+    ) -> Result<Self> {
         let input_dir = if dir.join("input").is_dir() {
             dir.join("input")
         } else if dir.join("INPUT").is_dir() {
@@ -378,13 +400,18 @@ impl Chantier {
         if input_dir != dir {
             collect_files_recursive(dir, 1, &mut all_files);
         }
+        // Also scan non-stereopipeline output dirs (e.g. AEROPHOTOGRAM output/) for JSON calibration files
+        let mut json_extra = Vec::new();
+        collect_json_calib_files(dir, 3, &mut json_extra);
 
         let mut cam_file: Option<PathBuf> = None;
         let mut txt_candidates: Vec<PathBuf> = Vec::new();
         let mut gcp_file: Option<PathBuf> = None;
+        let mut gcp_picks_candidates: Vec<PathBuf> = Vec::new();
+        let mut footprints_candidates: Vec<PathBuf> = Vec::new();
         let mut tif_map: HashMap<String, PathBuf> = HashMap::new();
 
-        for path in all_files {
+        for path in all_files.into_iter().chain(json_extra.into_iter()) {
             let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -419,6 +446,17 @@ impl Chantier {
                         txt_candidates.push(path);
                     }
                 }
+                "json" => {
+                    if fname_low.contains("gcp_pick") || (fname_low.contains("gcp") && fname_low.contains("pick")) {
+                        if !gcp_picks_candidates.contains(&path) {
+                            gcp_picks_candidates.push(path);
+                        }
+                    } else if fname_low.contains("footprint") || fname_low.contains("empreinte") {
+                        if !footprints_candidates.contains(&path) {
+                            footprints_candidates.push(path);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -445,6 +483,44 @@ impl Chantier {
             .as_ref()
             .and_then(|p| parse_gcp_file(p).ok())
             .unwrap_or_default();
+
+        // Load user-validated subpixel GCP picks JSON (explicit override or best auto-discovered file)
+        let (gcp_picks_file, gcp_picks) = if let Some(ov) = gcp_picks_override {
+            let picks = parse_gcp_picks_file(ov)?;
+            (Some(ov.to_path_buf()), picks)
+        } else {
+            let mut best_picks: Option<(PathBuf, Vec<GcpImagePick>)> = None;
+            for cand in gcp_picks_candidates {
+                if let Ok(picks) = parse_gcp_picks_file(&cand) {
+                    if best_picks.as_ref().map_or(true, |(_, bp)| picks.len() > bp.len()) {
+                        best_picks = Some((cand, picks));
+                    }
+                }
+            }
+            match best_picks {
+                Some((p, v)) => (Some(p), v),
+                None => (None, Vec::new()),
+            }
+        };
+
+        // Load validated ground footprints JSON (explicit override or best auto-discovered file)
+        let (footprints_file, footprints) = if let Some(ov) = footprints_override {
+            let fps = parse_footprints_file(ov)?;
+            (Some(ov.to_path_buf()), fps)
+        } else {
+            let mut best_fp: Option<(PathBuf, HashMap<String, ValidatedFootprint>)> = None;
+            for cand in footprints_candidates {
+                if let Ok(fps) = parse_footprints_file(&cand) {
+                    if best_fp.as_ref().map_or(true, |(_, bf)| fps.len() > bf.len()) {
+                        best_fp = Some((cand, fps));
+                    }
+                }
+            }
+            match best_fp {
+                Some((p, v)) => (Some(p), v),
+                None => (None, HashMap::new()),
+            }
+        };
 
         // Match poses to GeoTIFF files on disk
         let matched: Vec<(ImagePose, PathBuf)> = poses
@@ -498,17 +574,40 @@ impl Chantier {
             });
         }
 
-        Ok(Self {
+        let mut chantier = Self {
             root_dir: dir.to_path_buf(),
             input_dir,
             camera_file,
             trajectory_file,
             gcp_file,
+            gcp_picks_file,
+            footprints_file,
             calibration,
             poses,
             gcps,
+            gcp_picks,
+            footprints,
+            footprint_report: None,
+            ba_report: None,
             pairs,
-        })
+        };
+
+        // 1. Two-stage f64 LM pose & block refinement using user-validated subpixel GCP picks
+        if enable_gcp_refine && !chantier.gcp_picks.is_empty() {
+            chantier.ba_report = refine_chantier_with_gcp_picks(&mut chantier);
+        }
+
+        // 2. Cross-validate camera poses & orientations against validated ground footprints
+        if !chantier.footprints.is_empty() {
+            chantier.footprint_report = Some(validate_chantier_footprints(
+                &chantier.calibration,
+                &chantier.poses,
+                &chantier.gcps,
+                &chantier.footprints,
+            ));
+        }
+
+        Ok(chantier)
     }
 
     pub fn estimated_ground_z(&self, pair: &StereoPairEntry) -> f64 {
@@ -1113,6 +1212,8 @@ pub struct FullModelPlan {
     /// Tiles grouped into strip-friendly bands so each compressed GeoTIFF strip is decoded ONCE per band.
     pub bands: Vec<Vec<ModelTileSpec>>,
     pub total_tiles: usize,
+    /// Validated ground overlap polygon area (m^2) from `aerophotogram_footprints_validation.json`, if available.
+    pub validated_overlap_area_m2: Option<f64>,
 }
 
 impl FullModelPlan {
@@ -1215,10 +1316,32 @@ pub fn plan_full_model(
         .ok_or_else(|| PipelineError::Geometry("Right image footprint failed ground intersection".into()))?;
 
     let inset = 16.0;
-    let u_min = lu0.max(ru0) + inset;
-    let u_max = lu1.min(ru1) - inset;
-    let v_min = lv0.max(rv0) + inset;
-    let v_max = lv1.min(rv1) - inset;
+    let mut u_min = lu0.max(ru0) + inset;
+    let mut u_max = lu1.min(ru1) - inset;
+    let mut v_min = lv0.max(rv0) + inset;
+    let mut v_max = lv1.min(rv1) - inset;
+
+    // Cross-check and tighten overlap bounds with validated ground footprints when available
+    let mut validated_overlap_area_m2 = None;
+    if let Some((fu0, fu1, fv0, fv1, area_m2)) = validated_pair_overlap_bounds(
+        &chantier.footprints,
+        &pair.left_pose.id,
+        &pair.right_pose.id,
+        ground_z,
+        &rect_l,
+    ) {
+        validated_overlap_area_m2 = Some(area_m2);
+        let cu0 = u_min.max(fu0);
+        let cu1 = u_max.min(fu1);
+        let cv0 = v_min.max(fv0);
+        let cv1 = v_max.min(fv1);
+        if cu1 > cu0 + 64.0 && cv1 > cv0 + 64.0 {
+            u_min = cu0;
+            u_max = cu1;
+            v_min = cv0;
+            v_max = cv1;
+        }
+    }
 
     if u_max <= u_min + 64.0 || v_max <= v_min + 64.0 {
         return Err(PipelineError::Geometry(format!(
@@ -1319,6 +1442,7 @@ pub fn plan_full_model(
         tiles_y,
         bands,
         total_tiles,
+        validated_overlap_area_m2,
     })
 }
 
@@ -1638,6 +1762,24 @@ fn collect_files_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Scan chantier directories (including AEROPHOTOGRAM output folders, excluding Output_stereopipeline)
+/// for `.json` calibration files (`GCP_picks*.json`, `*footprint*.json`).
+fn collect_json_calib_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+                if depth > 0 && !name.starts_with('.') && !name.contains("stereopipeline") {
+                    collect_json_calib_files(&p, depth - 1, out);
+                }
+            } else if p.extension().and_then(|e| e.to_str()).map_or(false, |e| e.eq_ignore_ascii_case("json")) {
+                out.push(p);
+            }
+        }
+    }
+}
+
 fn find_image_for_pose(pose_id: &str, tif_map: &HashMap<String, PathBuf>) -> Option<PathBuf> {
     let low = pose_id.trim().to_ascii_lowercase();
     if let Some(p) = tif_map.get(&low) {
@@ -1875,6 +2017,8 @@ IMG_2 1901500.0 3145250.0 2030.0 0.10 0.20 200.00
             camera_file: PathBuf::new(),
             trajectory_file: PathBuf::new(),
             gcp_file: None,
+            gcp_picks_file: None,
+            footprints_file: None,
             calibration: cal,
             poses: vec![p0, p1],
             gcps: vec![GroundControlPoint {
@@ -1883,6 +2027,10 @@ IMG_2 1901500.0 3145250.0 2030.0 0.10 0.20 200.00
                 y: 3_146_829.0,
                 z: 242.0,
             }],
+            gcp_picks: Vec::new(),
+            footprints: HashMap::new(),
+            footprint_report: None,
+            ba_report: None,
             pairs: vec![pair.clone()],
         };
 

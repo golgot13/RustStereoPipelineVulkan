@@ -3,6 +3,7 @@
 
 pub mod cancel;
 pub mod chantier;
+pub mod chantier_calib;
 pub mod crs;
 pub mod error;
 pub mod hardware;

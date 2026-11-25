@@ -16,6 +16,7 @@ use crate::core::chantier::{
     chantier_summary_json, load_source_band_for_tiles, plan_full_model,
     prepare_stereo_pair_roi_opts, rectify_full_model_tile, validate_dem_against_gcps, Chantier,
 };
+use crate::core::chantier_calib::pair_gcp_epipolar_dy;
 use crate::core::crs::{transform_point, CrsId};
 use crate::core::error::{PipelineError, Result};
 use crate::core::hardware::{HardwareProfile, ProfileTier};
@@ -79,7 +80,7 @@ USAGE:
 
 COMMANDS:
   chantier <chantier_dir> [--output <dir>] [--pair N | --all-pairs] [--full-model] [--express] [--roi-size 1024] [--merge-voxel <m>]
-      Auto-discover .CAM, trajectory .TXT, GCP, and GeoTIFF stereo pairs (e.g. Meyreuil DMC-IV 433Mpx)
+      Auto-discover .CAM, trajectory .TXT, GCP, GCP_picks*.json, footprints JSON, and GeoTIFF stereo pairs
       and run streaming Full-Scale 1:1 stereo reconstruction into Output_stereopipeline
       (--full-model processes ALL 1:1 tiles covering the entire stereo overlap; --express skips all intermediate outputs)
   merge-ply <dir_or_ply1 ...> --output <merged.ply> [--merge-voxel <m>]
@@ -124,6 +125,9 @@ SCRIPTING & ROBUSTNESS OPTIONS:
   --profile <tier>               Hardware RAM tier: compact | standard | workstation
   --crs <code|name>              Output CRS: LOCAL | EPSG:4326 | EPSG:2154 | EPSG:3942..3950 (CC42..CC50) | EPSG:32631 | IAU:MOON | IAU:MARS
   --center-gcp                   In chantier mode, center 1:1 ROI on closest overlapping GCP
+  --gcp-picks <file.json>        Explicit path to user-validated subpixel GCP picks JSON (auto-discovered if omitted)
+  --footprints <file.json>       Explicit path to validated ground footprints JSON (auto-discovered if omitted)
+  --no-gcp-refine                Disable two-stage f64 LM GCP-pick pose refinement (keep raw GNSS/IMU poses)
   --full-model                   Process ALL 1:1 tiles covering the complete overlap of each stereo model
   --express                      Express benchmark mode: ZERO intermediate outputs (only dense RGB f64 PLY + exact timings)
   --merge-cloud                  Produce unified RGB f64 chantier_merged-PC.ply (auto-ON for --all-pairs)
@@ -189,6 +193,9 @@ struct ParsedArgs {
     merge_voxel: f64,
     full_model: bool,
     express: bool,
+    gcp_picks_path: Option<String>,
+    footprints_path: Option<String>,
+    no_gcp_refine: bool,
 }
 
 fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
@@ -230,6 +237,9 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
     let mut merge_voxel = 0.0f64;
     let mut full_model = false;
     let mut express = false;
+    let mut gcp_picks_path = None;
+    let mut footprints_path = None;
+    let mut no_gcp_refine = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -332,6 +342,9 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
             }
             "--all-pairs" => all_pairs = true,
             "--center-gcp" => center_gcp = true,
+            "--gcp-picks" => gcp_picks_path = Some(next(&mut i, a)?.to_string()),
+            "--footprints" => footprints_path = Some(next(&mut i, a)?.to_string()),
+            "--no-gcp-refine" => no_gcp_refine = true,
             "--full-model" => full_model = true,
             "--express" => {
                 express = true;
@@ -405,6 +418,9 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
         merge_voxel,
         full_model,
         express,
+        gcp_picks_path,
+        footprints_path,
+        no_gcp_refine,
     })
 }
 
@@ -502,12 +518,17 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| root_path.join("Output_stereopipeline"));
     std::fs::create_dir_all(&out_dir)?;
 
-    let chantier = Chantier::discover(root_path)?;
+    let chantier = Chantier::discover_with_opts(
+        root_path,
+        p.gcp_picks_path.as_deref().map(Path::new),
+        p.footprints_path.as_deref().map(Path::new),
+        !p.no_gcp_refine,
+    )?;
     if !p.ndjson {
         println!("=== Chantier Aérien Découvert ===");
         println!("  Répertoire   : {}", chantier.input_dir.display());
         println!(
-            "  Caméra .CAM  : {} ({}x{} px, f={:.2} mm, pitch={:.4} mm)",
+            "  Caméra .CAM  : {} ({}x{} px, f={:.4} mm, pitch={:.6} mm)",
             chantier.calibration.name,
             chantier.calibration.width_px,
             chantier.calibration.height_px,
@@ -516,6 +537,58 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         );
         println!("  Trajectoire  : {} ({} poses)", chantier.trajectory_file.display(), chantier.poses.len());
         println!("  GCP Terrain  : {} points", chantier.gcps.len());
+        if let Some(ref fp_path) = chantier.footprints_file {
+            if let Some(ref fr) = chantier.footprint_report {
+                println!(
+                    "  Empreintes   : {} ({}/{} poses | IoU moy={:.1}% min={:.1}% | dXY={:.2} m | orient. OK={}/{})",
+                    fp_path.display(),
+                    fr.matched_poses,
+                    fr.total_poses,
+                    fr.mean_iou_pct,
+                    fr.min_iou_pct,
+                    fr.mean_center_err_m,
+                    fr.orientation_ok,
+                    fr.matched_poses
+                );
+                if !fr.orientation_failed_ids.is_empty() {
+                    println!("  [WARN] Empreintes orient. divergente : {:?}", fr.orientation_failed_ids);
+                }
+            }
+        }
+        if let Some(ref gp_path) = chantier.gcp_picks_file {
+            println!("  GCP Picking  : {} ({} pointés subpixels)", gp_path.display(), chantier.gcp_picks.len());
+            if let Some(ref ba) = chantier.ba_report {
+                println!(
+                    "  Raffinement  : {} ({} obs., {} GCP, {} clichés) | Global dXYZ=({:+.3},{:+.3},{:+.3}) m dOPK=({:+.4},{:+.4},{:+.4})° df={:+.4} mm",
+                    if ba.applied { "APPLIQUÉ" } else { "IGNORÉ" },
+                    ba.matched_observations,
+                    ba.matched_gcps,
+                    ba.refined_images,
+                    ba.global_dx_m,
+                    ba.global_dy_m,
+                    ba.global_dz_m,
+                    ba.global_domega_deg,
+                    ba.global_dphi_deg,
+                    ba.global_dkappa_deg,
+                    ba.global_dfocal_mm
+                );
+                println!(
+                    "                 Reproj RMSE : {:.3} px -> {:.3} px (Stage1={:.3} px) | Épipolaire dy : {:.3} px -> {:.3} px",
+                    ba.initial_reproj_rmse_px,
+                    ba.final_reproj_rmse_px,
+                    ba.stage1_reproj_rmse_px,
+                    ba.initial_epi_dy_rmse_px,
+                    ba.final_epi_dy_rmse_px
+                );
+                println!(
+                    "                 3D GCP Tri  : biais dZ={:+.3} m -> {:+.3} m | RMSE XYZ={:.3} m -> {:.3} m",
+                    ba.initial_tri_dz_bias_m,
+                    ba.final_tri_dz_bias_m,
+                    ba.initial_tri_xyz_rmse_m,
+                    ba.final_tri_xyz_rmse_m
+                );
+            }
+        }
         println!("  Paires Stéréo: {} paires détectées par ligne de vol", chantier.pairs.len());
         println!("  Sortie       : {}", out_dir.display());
     }
@@ -856,8 +929,12 @@ fn run_chantier_full_model(
             );
             println!("  Left         : {} ({}x{} px)", pair.left_image_path.display(), plan.full_dims_l.0, plan.full_dims_l.1);
             println!("  Right        : {} ({}x{} px)", pair.right_image_path.display(), plan.full_dims_r.0, plan.full_dims_r.1);
+            let area_str = match plan.validated_overlap_area_m2 {
+                Some(a) => format!(" | Surface validée={:.2} ha", a / 10_000.0),
+                None => String::new(),
+            };
             println!(
-                "  Recouvrement : {}x{} px ({:.1} Mpx 1:1) | Grille {}x{} = {} dalles ({} bandes source) | Z_ref={:.2} m",
+                "  Recouvrement : {}x{} px ({:.1} Mpx 1:1) | Grille {}x{} = {} dalles ({} bandes source) | Z_ref={:.2} m{}",
                 plan.overlap_w,
                 plan.overlap_h,
                 overlap_mpx,
@@ -865,8 +942,15 @@ fn run_chantier_full_model(
                 plan.tiles_y,
                 plan.total_tiles,
                 plan.bands.len(),
-                plan.ground_z_ref
+                plan.ground_z_ref,
+                area_str
             );
+            if let Some((n_gcp, dy_rmse, dy_max)) = pair_gcp_epipolar_dy(&chantier.calibration, pair, &chantier.gcp_picks) {
+                println!(
+                    "  Épipolaire   : {} GCP pointés communs | dy RMSE={:.3} px (max={:.3} px)",
+                    n_gcp, dy_rmse, dy_max
+                );
+            }
             if write_model_ply {
                 println!("  Nuage Modèle : {}", model_ply_path.display());
             }
