@@ -256,6 +256,23 @@ impl GeoTiffReader {
         let is_planar = m.planar_config == 2;
         let samples_in_block = if is_planar { 1 } else { spp };
 
+        struct BlockTask {
+            block_w: usize,
+            block_h: usize,
+            bx0: u32,
+            by0: u32,
+            ix0: u32,
+            iy0: u32,
+            ix1: u32,
+            iy1: u32,
+            band: usize,
+            expected_out: usize,
+            comp: Vec<u8>,
+        }
+
+        let mut tasks: Vec<BlockTask> = Vec::new();
+        let bands_to_read = if is_planar { spp.min(3) } else { 1 };
+
         if m.is_tiled {
             let tw = m.tile_width;
             let th = m.tile_height;
@@ -266,7 +283,6 @@ impl GeoTiffReader {
             let ty0 = y0 / th;
             let ty1 = ((y0 + h - 1) / th).min(tiles_y - 1);
             let expected_block_bytes = (tw as usize) * (th as usize) * samples_in_block * bytes_per_sample;
-            let bands_to_read = if is_planar { spp.min(3) } else { 1 };
             let tiles_per_band = (tiles_x * tiles_y) as usize;
 
             for ty in ty0..=ty1 {
@@ -283,37 +299,23 @@ impl GeoTiffReader {
                         if bidx >= m.block_offsets.len() {
                             continue;
                         }
-                        let mut raw = read_and_decompress_block(
-                            &mut f,
-                            m.block_offsets[bidx],
-                            m.block_byte_counts.get(bidx).copied().unwrap_or(expected_block_bytes as u64),
-                            m.compression,
-                            expected_block_bytes,
-                        )?;
-                        if m.predictor == 2 {
-                            apply_horizontal_predictor(&mut raw, tw as usize, th as usize, samples_in_block, bytes_per_sample, m.little_endian);
-                        }
-                        copy_block_to_roi(
-                            &raw,
-                            tw as usize,
-                            tile_x0,
-                            tile_y0,
+                        let byte_count = m.block_byte_counts.get(bidx).copied().unwrap_or(expected_block_bytes as u64);
+                        f.seek(SeekFrom::Start(m.block_offsets[bidx]))?;
+                        let mut comp = vec![0u8; byte_count as usize];
+                        f.read_exact(&mut comp)?;
+                        tasks.push(BlockTask {
+                            block_w: tw as usize,
+                            block_h: th as usize,
+                            bx0: tile_x0,
+                            by0: tile_y0,
                             ix0,
                             iy0,
                             ix1,
                             iy1,
-                            x0,
-                            y0,
-                            samples_in_block,
-                            bytes_per_sample,
-                            m.sample_format,
-                            m.little_endian,
-                            is_planar,
                             band,
-                            bands_to_read,
-                            &mut out,
-                            out_rgb.as_mut(),
-                        );
+                            expected_out: expected_block_bytes,
+                            comp,
+                        });
                     }
                 }
             }
@@ -323,7 +325,6 @@ impl GeoTiffReader {
             let num_strips_per_band = ((m.height + rps - 1) / rps) as usize;
             let s0 = (y0 / rps) as usize;
             let s1 = (((y0 + h - 1) / rps) as usize).min(num_strips_per_band.saturating_sub(1));
-            let bands_to_read = if is_planar { spp.min(3) } else { 1 };
 
             for s in s0..=s1 {
                 let strip_y0 = (s as u32) * rps;
@@ -337,39 +338,101 @@ impl GeoTiffReader {
                     if bidx >= m.block_offsets.len() {
                         continue;
                     }
-                    let mut raw = read_and_decompress_block(
-                        &mut f,
-                        m.block_offsets[bidx],
-                        m.block_byte_counts.get(bidx).copied().unwrap_or(expected_block_bytes as u64),
-                        m.compression,
-                        expected_block_bytes,
-                    )?;
-                    if m.predictor == 2 {
-                        apply_horizontal_predictor(&mut raw, m.width as usize, strip_h as usize, samples_in_block, bytes_per_sample, m.little_endian);
-                    }
-                    copy_block_to_roi(
-                        &raw,
-                        m.width as usize,
-                        0,
-                        strip_y0,
-                        x0,
+                    let byte_count = m.block_byte_counts.get(bidx).copied().unwrap_or(expected_block_bytes as u64);
+                    f.seek(SeekFrom::Start(m.block_offsets[bidx]))?;
+                    let mut comp = vec![0u8; byte_count as usize];
+                    f.read_exact(&mut comp)?;
+                    tasks.push(BlockTask {
+                        block_w: m.width as usize,
+                        block_h: strip_h as usize,
+                        bx0: 0,
+                        by0: strip_y0,
+                        ix0: x0,
                         iy0,
-                        x0 + w,
+                        ix1: x0 + w,
                         iy1,
-                        x0,
-                        y0,
-                        samples_in_block,
-                        bytes_per_sample,
-                        m.sample_format,
-                        m.little_endian,
-                        is_planar,
                         band,
-                        bands_to_read,
-                        &mut out,
-                        out_rgb.as_mut(),
-                    );
+                        expected_out: expected_block_bytes,
+                        comp,
+                    });
                 }
             }
+        }
+
+        // Parallelize Deflate/LZW/PackBits decompression + horizontal predictor across CPU threads
+        let compression = m.compression;
+        let predictor = m.predictor;
+        let little_endian = m.little_endian;
+        let mut decoded: Vec<Result<Vec<u8>>> = (0..tasks.len()).map(|_| Ok(Vec::new())).collect();
+        if tasks.len() >= 2 && compression != 1 {
+            let n_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, tasks.len());
+            let per_thread = (tasks.len() + n_threads - 1) / n_threads;
+            std::thread::scope(|scope| {
+                for (t_chunk, d_chunk) in tasks.chunks(per_thread).zip(decoded.chunks_mut(per_thread)) {
+                    scope.spawn(move || {
+                        for (task, slot) in t_chunk.iter().zip(d_chunk.iter_mut()) {
+                            let res = decompress_block(&task.comp, compression, task.expected_out).map(|mut raw| {
+                                if predictor == 2 {
+                                    apply_horizontal_predictor(
+                                        &mut raw,
+                                        task.block_w,
+                                        task.block_h,
+                                        samples_in_block,
+                                        bytes_per_sample,
+                                        little_endian,
+                                    );
+                                }
+                                raw
+                            });
+                            *slot = res;
+                        }
+                    });
+                }
+            });
+        } else {
+            for (task, slot) in tasks.iter().zip(decoded.iter_mut()) {
+                *slot = decompress_block(&task.comp, compression, task.expected_out).map(|mut raw| {
+                    if predictor == 2 {
+                        apply_horizontal_predictor(
+                            &mut raw,
+                            task.block_w,
+                            task.block_h,
+                            samples_in_block,
+                            bytes_per_sample,
+                            little_endian,
+                        );
+                    }
+                    raw
+                });
+            }
+        }
+
+        for (task, raw_res) in tasks.iter().zip(decoded.into_iter()) {
+            let raw = raw_res?;
+            copy_block_to_roi(
+                &raw,
+                task.block_w,
+                task.bx0,
+                task.by0,
+                task.ix0,
+                task.iy0,
+                task.ix1,
+                task.iy1,
+                x0,
+                y0,
+                samples_in_block,
+                bytes_per_sample,
+                m.sample_format,
+                m.little_endian,
+                is_planar,
+                task.band,
+                bands_to_read,
+                &mut out,
+                out_rgb.as_mut(),
+            );
         }
 
         Ok((out, out_rgb))
@@ -479,21 +542,12 @@ fn decode_sample(b: &[u8], bps_bytes: usize, sample_format: u16, le: bool) -> f3
     }
 }
 
-fn read_and_decompress_block(
-    f: &mut File,
-    offset: u64,
-    byte_count: u64,
-    compression: u16,
-    expected_out: usize,
-) -> Result<Vec<u8>> {
-    f.seek(SeekFrom::Start(offset))?;
-    let mut comp = vec![0u8; byte_count as usize];
-    f.read_exact(&mut comp)?;
+fn decompress_block(comp: &[u8], compression: u16, expected_out: usize) -> Result<Vec<u8>> {
     match compression {
-        1 => Ok(comp),
-        5 => decode_tiff_lzw(&comp, expected_out),
-        8 | 32946 => decode_zlib(&comp, expected_out),
-        32773 => Ok(decode_packbits(&comp, expected_out)),
+        1 => Ok(comp.to_vec()),
+        5 => decode_tiff_lzw(comp, expected_out),
+        8 | 32946 => decode_zlib(comp, expected_out),
+        32773 => Ok(decode_packbits(comp, expected_out)),
         other => Err(PipelineError::Format(format!(
             "Unsupported TIFF compression {} (supported: 1=None, 5=LZW, 8=Deflate, 32773=PackBits)",
             other

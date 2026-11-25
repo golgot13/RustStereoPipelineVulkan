@@ -50,6 +50,20 @@ pub struct PipelineResult {
     pub timings: StageTimings,
 }
 
+/// Output of a single 1:1 express stereo tile (no DEM/hillshade/disk overhead).
+#[derive(Debug, Clone)]
+pub struct ExpressTileOutput {
+    pub point_cloud: PointCloud,
+    pub valid_pct: f64,
+    pub median_dx: Option<f32>,
+    pub pprc_ms: f64,
+    pub corr_ms: f64,
+    pub rfne_ms: f64,
+    pub fltr_ms: f64,
+    pub tri_ms: f64,
+    pub vk_dispatches: usize,
+}
+
 /// Top-level Stereo Pipeline Engine holding an optional live Vulkan Compute context.
 pub struct StereoPipelineEngine {
     pub vulkan: Option<VulkanCompute>,
@@ -171,6 +185,81 @@ impl StereoPipelineEngine {
                 active_backend,
                 vk_dispatches,
             },
+        }
+    }
+
+    /// Ultra-lean express stereo execution for a single 1:1 tile:
+    /// runs `pprc -> corr -> rfne -> fltr -> tri` + attaches true RGB with ZERO `point2dem`,
+    /// ZERO hillshade, ZERO disk I/O, and exact real per-stage timings.
+    pub fn run_express_tile(
+        &self,
+        left: &ImageF32,
+        left_rgb: Option<&crate::image::ImageRgb>,
+        right: &ImageF32,
+        cam_left: &AnyCamera,
+        cam_right: &AnyCamera,
+        settings: &StereoSettings,
+    ) -> ExpressTileOutput {
+        let vk = match settings.backend {
+            ComputeBackendPreference::Cpu => None,
+            _ => self.vulkan.as_ref(),
+        };
+        let mut vk_dispatches = 0usize;
+
+        let t0 = Instant::now();
+        let (left_pprc, right_pprc, used_vk0) = pprc::run_pprc(left, right, settings, vk);
+        let pprc_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if used_vk0 { vk_dispatches += 2; }
+
+        let t1 = Instant::now();
+        let (disp_raw, used_vk1) = corr::run_corr_with_guide(&left_pprc, &right_pprc, Some(left), settings, vk);
+        let corr_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        if used_vk1 { vk_dispatches += 2; }
+
+        let t2 = Instant::now();
+        let disp_refined = rfne::run_rfne(&left_pprc, &right_pprc, &disp_raw, settings);
+        let rfne_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        drop(disp_raw);
+
+        let t3 = Instant::now();
+        let disp_filtered = fltr::run_fltr(&disp_refined, settings);
+        let fltr_ms = t3.elapsed().as_secs_f64() * 1000.0;
+        drop(disp_refined);
+
+        let valid_pct = disp_filtered.valid_fraction() as f64 * 100.0;
+        let median_dx = {
+            let mut vals = Vec::new();
+            let step = (disp_filtered.dx.len() / 2048).max(1);
+            for i in (0..disp_filtered.dx.len()).step_by(step) {
+                if disp_filtered.valid[i] != 0 && disp_filtered.dx[i].is_finite() {
+                    vals.push(disp_filtered.dx[i]);
+                }
+            }
+            if vals.is_empty() {
+                None
+            } else {
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                Some(vals[vals.len() / 2])
+            }
+        };
+
+        let t4 = Instant::now();
+        let mut point_cloud = tri::run_tri(left, &disp_filtered, cam_left, cam_right, settings);
+        if let Some(rgb) = left_rgb {
+            point_cloud.apply_rgb(rgb);
+        }
+        let tri_ms = t4.elapsed().as_secs_f64() * 1000.0;
+
+        ExpressTileOutput {
+            point_cloud,
+            valid_pct,
+            median_dx,
+            pprc_ms,
+            corr_ms,
+            rfne_ms,
+            fltr_ms,
+            tri_ms,
+            vk_dispatches,
         }
     }
 

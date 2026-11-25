@@ -643,19 +643,18 @@ pub fn build_epipolar_rectified_cameras(
     (rect_l, rect_r)
 }
 
-/// Stream only the minimal source bounding box needed from a 433 Mpx GeoTIFF and bilinearly warp
-/// into the exact epipolar-rectified `out_w x out_h` grid (optionally preserving true RGB color).
-fn stream_and_rectify_roi(
-    reader: &GeoTiffReader,
+/// Compute the minimal source GeoTIFF bounding box `(x0, y0, sw, sh)` needed to bilinearly warp
+/// a rectified tile `(0..out_w, 0..out_h)`. Returns `None` if the tile falls outside the source image.
+fn compute_source_bbox_for_rect_cam(
+    src_w: u32,
+    src_h: u32,
     full_cam: &PinholeCamera,
     rect_cam: &PinholeCamera,
     out_w: u32,
     out_h: u32,
-    keep_rgb: bool,
-) -> Result<(ImageF32, Option<crate::image::ImageRgb>, (u32, u32, u32, u32))> {
-    let fw = reader.meta.width as f64;
-    let fh = reader.meta.height as f64;
-
+) -> Option<(u32, u32, u32, u32)> {
+    let fw = src_w as f64;
+    let fh = src_h as f64;
     let mut min_sx = f64::INFINITY;
     let mut max_sx = f64::NEG_INFINITY;
     let mut min_sy = f64::INFINITY;
@@ -677,26 +676,30 @@ fn stream_and_rectify_roi(
         }
     }
 
-    if !min_sx.is_finite() || !min_sy.is_finite() {
-        return Err(PipelineError::Geometry(
-            "Rectified ROI projects outside the source GeoTIFF sensor footprint".into(),
-        ));
+    if !min_sx.is_finite() || !min_sy.is_finite() || max_sx < 0.0 || max_sy < 0.0 || min_sx >= fw || min_sy >= fh {
+        return None;
     }
 
-    let x0 = (min_sx.floor() as i64 - 4).clamp(0, (reader.meta.width.saturating_sub(1)) as i64) as u32;
-    let y0 = (min_sy.floor() as i64 - 4).clamp(0, (reader.meta.height.saturating_sub(1)) as i64) as u32;
+    let x0 = (min_sx.floor() as i64 - 4).clamp(0, (src_w.saturating_sub(1)) as i64) as u32;
+    let y0 = (min_sy.floor() as i64 - 4).clamp(0, (src_h.saturating_sub(1)) as i64) as u32;
     let x1 = (max_sx.ceil() as i64 + 5).clamp((x0 + 1) as i64, fw as i64) as u32;
     let y1 = (max_sy.ceil() as i64 + 5).clamp((y0 + 1) as i64, fh as i64) as u32;
-    let sw = (x1 - x0).max(1);
-    let sh = (y1 - y0).max(1);
+    Some((x0, y0, (x1 - x0).max(1), (y1 - y0).max(1)))
+}
 
-    let (patch, patch_rgb) = if keep_rgb {
-        reader.read_roi_with_rgb(x0, y0, sw, sh)?
-    } else {
-        (reader.read_roi(x0, y0, sw, sh)?, None)
-    };
+/// Multi-threaded exact `f64` bilinear epipolar warp from an already-loaded source patch `(x0, y0)`.
+fn warp_rectified_from_patch(
+    patch: &ImageF32,
+    patch_rgb: Option<&crate::image::ImageRgb>,
+    x0: u32,
+    y0: u32,
+    full_cam: &PinholeCamera,
+    rect_cam: &PinholeCamera,
+    out_w: u32,
+    out_h: u32,
+) -> (ImageF32, Option<crate::image::ImageRgb>) {
     let mut out = ImageF32::new(out_w, out_h);
-    let mut out_rgb = patch_rgb.as_ref().map(|_| crate::image::ImageRgb::new(out_w, out_h));
+    let mut out_rgb = patch_rgb.map(|_| crate::image::ImageRgb::new(out_w, out_h));
     let w_usize = out_w as usize;
     let h_usize = out_h as usize;
     let n_threads = std::thread::available_parallelism()
@@ -705,12 +708,51 @@ fn stream_and_rectify_roi(
         .clamp(1, h_usize.max(1));
     let rows_per = (h_usize + n_threads - 1) / n_threads;
 
+    // Exact f64 relative rotation from rectified camera frame to original sensor camera frame
+    let r_rel = full_cam.rotation.transpose().mul_mat(&rect_cam.rotation);
+    let has_dist = full_cam.distortion.iter().any(|&c| c.abs() > 1e-18);
+    let [k1, k2, p1, p2] = full_cam.distortion;
+    let inv_rfu = 1.0 / rect_cam.fu;
+    let inv_rfv = 1.0 / rect_cam.fv;
+    let rcu = rect_cam.cu;
+    let rcv = rect_cam.cv;
+    let ffu = full_cam.fu;
+    let ffv = full_cam.fv;
+    let fcu = full_cam.cu;
+    let fcv = full_cam.cv;
+    let inv_pitch = 1.0 / full_cam.pitch.max(1e-12);
+    let m = r_rel.m;
+
     let x0_f = x0 as f64;
     let y0_f = y0 as f64;
     let pw = patch.width as i32;
     let ph = patch.height as i32;
     let pdata = &patch.data;
-    let prgb_ref = patch_rgb.as_ref();
+
+    let map_pixel = move |u_f: f64, v_f: f64| -> (f64, f64) {
+        let rx = (u_f - rcu) * inv_rfu;
+        let ry = (v_f - rcv) * inv_rfv;
+        let cx = m[0][0] * rx + m[0][1] * ry + m[0][2];
+        let cy = m[1][0] * rx + m[1][1] * ry + m[1][2];
+        let cz = m[2][0] * rx + m[2][1] * ry + m[2][2];
+        let inv_z = 1.0 / if cz.abs() < 1e-12 { 1e-12 } else { cz };
+        let xn = cx * inv_z;
+        let yn = cy * inv_z;
+        let (xd, yd) = if has_dist {
+            let r2 = xn * xn + yn * yn;
+            let rad = 1.0 + k1 * r2 + k2 * r2 * r2;
+            (
+                xn * rad + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn),
+                yn * rad + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn,
+            )
+        } else {
+            (xn, yn)
+        };
+        (
+            (xd * ffu + fcu) * inv_pitch - x0_f,
+            (yd * ffv + fcv) * inv_pitch - y0_f,
+        )
+    };
 
     std::thread::scope(|scope| {
         if let Some(ref mut dst_rgb) = out_rgb {
@@ -727,10 +769,7 @@ fn stream_and_rectify_roi(
                         let v = (y_start + ly) as f64;
                         let row_off = ly * w_usize;
                         for u_idx in 0..w_usize {
-                            let ray = rect_cam.pixel_to_vector(Vec2::new(u_idx as f64, v));
-                            let src = full_cam.point_to_pixel(rect_cam.center + ray * 1000.0);
-                            let lx = src.x - x0_f;
-                            let ly_s = src.y - y0_f;
+                            let (lx, ly_s) = map_pixel(u_idx as f64, v);
                             if lx >= 0.0 && ly_s >= 0.0 && lx < (pw - 1) as f64 && ly_s < (ph - 1) as f64 {
                                 let ix = lx.floor() as i32;
                                 let iy = ly_s.floor() as i32;
@@ -743,7 +782,7 @@ fn stream_and_rectify_roi(
                                 let top = pdata[i00] * (1.0 - fx) + pdata[i10] * fx;
                                 let bot = pdata[i01] * (1.0 - fx) + pdata[i11] * fx;
                                 chunk[row_off + u_idx] = top * (1.0 - fy) + bot * fy;
-                                if let Some(pr) = prgb_ref {
+                                if let Some(pr) = patch_rgb {
                                     rgb_chunk[row_off + u_idx] = pr.sample_bilinear_clamped(lx, ly_s);
                                 }
                             } else {
@@ -763,10 +802,7 @@ fn stream_and_rectify_roi(
                         let v = (y_start + ly) as f64;
                         let row_off = ly * w_usize;
                         for u_idx in 0..w_usize {
-                            let ray = rect_cam.pixel_to_vector(Vec2::new(u_idx as f64, v));
-                            let src = full_cam.point_to_pixel(rect_cam.center + ray * 1000.0);
-                            let lx = src.x - x0_f;
-                            let ly_s = src.y - y0_f;
+                            let (lx, ly_s) = map_pixel(u_idx as f64, v);
                             if lx >= 0.0 && ly_s >= 0.0 && lx < (pw - 1) as f64 && ly_s < (ph - 1) as f64 {
                                 let ix = lx.floor() as i32;
                                 let iy = ly_s.floor() as i32;
@@ -789,17 +825,62 @@ fn stream_and_rectify_roi(
         }
     });
 
+    (out, out_rgb)
+}
+
+/// Stream only the minimal source bounding box needed from a 433 Mpx GeoTIFF and bilinearly warp
+/// into the exact epipolar-rectified `out_w x out_h` grid (optionally preserving true RGB color).
+fn stream_and_rectify_roi(
+    reader: &GeoTiffReader,
+    full_cam: &PinholeCamera,
+    rect_cam: &PinholeCamera,
+    out_w: u32,
+    out_h: u32,
+    keep_rgb: bool,
+) -> Result<(ImageF32, Option<crate::image::ImageRgb>, (u32, u32, u32, u32))> {
+    let (x0, y0, sw, sh) = compute_source_bbox_for_rect_cam(
+        reader.meta.width,
+        reader.meta.height,
+        full_cam,
+        rect_cam,
+        out_w,
+        out_h,
+    )
+    .ok_or_else(|| {
+        PipelineError::Geometry("Rectified ROI projects outside the source GeoTIFF sensor footprint".into())
+    })?;
+
+    let (patch, patch_rgb) = if keep_rgb {
+        reader.read_roi_with_rgb(x0, y0, sw, sh)?
+    } else {
+        (reader.read_roi(x0, y0, sw, sh)?, None)
+    };
+    let (out, out_rgb) = warp_rectified_from_patch(
+        &patch,
+        patch_rgb.as_ref(),
+        x0,
+        y0,
+        full_cam,
+        rect_cam,
+        out_w,
+        out_h,
+    );
     Ok((out, out_rgb, (x0, y0, sw, sh)))
 }
 
 /// Fast (~3 ms) 4x-downsampled 1D horizontal NCC sweep to lock the rectified epipolar search box
 /// directly onto the real local terrain elevation (handles +/- 80m elevation offset automatically).
-fn estimate_coarse_epipolar_shift(left: &ImageF32, right: &ImageF32, max_shift_px: i32) -> i32 {
+fn estimate_coarse_epipolar_shift_with_fallback(
+    left: &ImageF32,
+    right: &ImageF32,
+    max_shift_px: i32,
+    fallback_dx: i32,
+) -> i32 {
     let scale = 4u32;
     let dw = (left.width / scale) as usize;
     let dh = (left.height / scale) as usize;
     if dw < 32 || dh < 32 {
-        return 0;
+        return fallback_dx;
     }
 
     let downsample = |img: &ImageF32| -> Vec<f32> {
@@ -826,11 +907,12 @@ fn estimate_coarse_epipolar_shift(left: &ImageF32, right: &ImageF32, max_shift_p
     let y1 = dh - y0;
     let x_margin = max_d4 as usize + 4;
     if dw <= 2 * x_margin + 8 {
-        return 0;
+        return fallback_dx;
     }
 
     let mut best_d4 = 0i32;
     let mut best_ncc = 0.15f64;
+    let mut found = false;
     for d4 in -max_d4..=max_d4 {
         let mut sum_l = 0.0f64;
         let mut sum_r = 0.0f64;
@@ -866,10 +948,19 @@ fn estimate_coarse_epipolar_shift(left: &ImageF32, right: &ImageF32, max_shift_p
             if ncc > best_ncc {
                 best_ncc = ncc;
                 best_d4 = d4;
+                found = true;
             }
         }
     }
-    best_d4 * scale as i32
+    if found {
+        best_d4 * scale as i32
+    } else {
+        fallback_dx
+    }
+}
+
+fn estimate_coarse_epipolar_shift(left: &ImageF32, right: &ImageF32, max_shift_px: i32) -> i32 {
+    estimate_coarse_epipolar_shift_with_fallback(left, right, max_shift_px, 0)
 }
 
 pub struct PreparedStereoRoi {
@@ -986,6 +1077,391 @@ pub fn prepare_stereo_pair_roi_opts(
         coarse_dx_px: coarse_dx,
         anchored_gcp,
     })
+}
+
+/// One halo-padded 1:1 sliding-window tile inside a full stereo overlap model.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelTileSpec {
+    pub tx: u32,
+    pub ty: u32,
+    /// Padded global rectified origin `(px0, py0)` and tile dimensions `(tw, th)` (`<= tile_size`).
+    pub px0: u32,
+    pub py0: u32,
+    pub tw: u32,
+    pub th: u32,
+    /// Non-overlapping local interior core rectangle `[emit_x0..emit_x1, emit_y0..emit_y1)` emitted to PLY.
+    pub emit_x0: u32,
+    pub emit_y0: u32,
+    pub emit_x1: u32,
+    pub emit_y1: u32,
+}
+
+/// Complete Full-Scale 1:1 Fusiello epipolar tiling plan covering the entire overlap of a stereo model.
+pub struct FullModelPlan {
+    pub full_cam_l: PinholeCamera,
+    pub full_cam_r: PinholeCamera,
+    pub rect_cam_l: PinholeCamera,
+    pub rect_cam_r: PinholeCamera,
+    pub full_dims_l: (u32, u32),
+    pub full_dims_r: (u32, u32),
+    pub overlap_w: u32,
+    pub overlap_h: u32,
+    pub ground_z_ref: f64,
+    pub half_span: i32,
+    pub tiles_x: u32,
+    pub tiles_y: u32,
+    /// Tiles grouped into strip-friendly bands so each compressed GeoTIFF strip is decoded ONCE per band.
+    pub bands: Vec<Vec<ModelTileSpec>>,
+    pub total_tiles: usize,
+}
+
+impl FullModelPlan {
+    /// Build shifted Fusiello rectified pinhole cameras for a specific padded tile.
+    pub fn tile_cameras(&self, tile: &ModelTileSpec) -> (PinholeCamera, PinholeCamera) {
+        let mut cl = self.rect_cam_l.clone();
+        let mut cr = self.rect_cam_r.clone();
+        cl.cu -= tile.px0 as f64;
+        cl.cv -= tile.py0 as f64;
+        cr.cu -= tile.px0 as f64;
+        cr.cv -= tile.py0 as f64;
+        (cl, cr)
+    }
+}
+
+/// Cached source GeoTIFF strip-band loaded once in RAM for all tiles in a strip band.
+pub struct SourceBandBuffer {
+    pub x0: u32,
+    pub y0: u32,
+    pub gray: ImageF32,
+    pub rgb: Option<crate::image::ImageRgb>,
+}
+
+/// Prepared single 1:1 rectified tile from a `FullModelPlan`.
+pub struct PreparedFullModelTile {
+    pub left_img: ImageF32,
+    pub left_rgb: Option<crate::image::ImageRgb>,
+    pub right_img: ImageF32,
+    pub left_cam: AnyCamera,
+    pub right_cam: AnyCamera,
+    pub search_box: (i32, i32, i32, i32),
+    pub coarse_dx_px: i32,
+}
+
+fn sensor_ground_rect_bounds(
+    cam: &PinholeCamera,
+    w: u32,
+    h: u32,
+    ground_z: f64,
+    rect_ref: &PinholeCamera,
+) -> Option<(f64, f64, f64, f64)> {
+    let mut min_u = f64::INFINITY;
+    let mut max_u = f64::NEG_INFINITY;
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+    let samples = 9usize;
+    for j in 0..samples {
+        let py = (j as f64 / (samples - 1) as f64) * (h.saturating_sub(1)) as f64;
+        for i in 0..samples {
+            let px = (i as f64 / (samples - 1) as f64) * (w.saturating_sub(1)) as f64;
+            let ray = cam.pixel_to_vector(Vec2::new(px, py));
+            if ray.z.abs() < 1e-8 {
+                continue;
+            }
+            let t = (ground_z - cam.center.z) / ray.z;
+            if t <= 0.0 || !t.is_finite() {
+                continue;
+            }
+            let gp = cam.center + ray * t;
+            let rp = rect_ref.point_to_pixel(gp);
+            if rp.x.is_finite() && rp.y.is_finite() {
+                if rp.x < min_u { min_u = rp.x; }
+                if rp.x > max_u { max_u = rp.x; }
+                if rp.y < min_v { min_v = rp.y; }
+                if rp.y > max_v { max_v = rp.y; }
+            }
+        }
+    }
+    if min_u.is_finite() && min_v.is_finite() && max_u > min_u && max_v > min_v {
+        Some((min_u, max_u, min_v, max_v))
+    } else {
+        None
+    }
+}
+
+/// Plan the exact Full-Scale 1:1 Fusiello epipolar overlap grid covering the ENTIRE stereo model.
+pub fn plan_full_model(
+    chantier: &Chantier,
+    pair: &StereoPairEntry,
+    lw: u32,
+    lh: u32,
+    rw: u32,
+    rh: u32,
+    tile_size: u32,
+) -> Result<FullModelPlan> {
+    let full_cam_l = build_pinhole_for_pose(&chantier.calibration, &pair.left_pose, lw, lh, 0, 0);
+    let full_cam_r = build_pinhole_for_pose(&chantier.calibration, &pair.right_pose, rw, rh, 0, 0);
+
+    let mid_x = 0.5 * (pair.left_pose.x + pair.right_pose.x);
+    let mid_y = 0.5 * (pair.left_pose.y + pair.right_pose.y);
+    let ground_z = chantier.estimated_ground_z(pair);
+    let ground_anchor = Vec3::new(mid_x, mid_y, ground_z);
+
+    let (mut rect_l, mut rect_r) =
+        build_epipolar_rectified_cameras(&full_cam_l, &full_cam_r, ground_anchor, 1, 1);
+
+    let (lu0, lu1, lv0, lv1) = sensor_ground_rect_bounds(&full_cam_l, lw, lh, ground_z, &rect_l)
+        .ok_or_else(|| PipelineError::Geometry("Left image footprint failed ground intersection".into()))?;
+    let (ru0, ru1, rv0, rv1) = sensor_ground_rect_bounds(&full_cam_r, rw, rh, ground_z, &rect_l)
+        .ok_or_else(|| PipelineError::Geometry("Right image footprint failed ground intersection".into()))?;
+
+    let inset = 16.0;
+    let u_min = lu0.max(ru0) + inset;
+    let u_max = lu1.min(ru1) - inset;
+    let v_min = lv0.max(rv0) + inset;
+    let v_max = lv1.min(rv1) - inset;
+
+    if u_max <= u_min + 64.0 || v_max <= v_min + 64.0 {
+        return Err(PipelineError::Geometry(format!(
+            "Insufficient stereo overlap for pair {} (u=[{:.1}..{:.1}], v=[{:.1}..{:.1}])",
+            pair.name, u_min, u_max, v_min, v_max
+        )));
+    }
+
+    let overlap_w = (u_max - u_min).floor() as u32;
+    let overlap_h = (v_max - v_min).floor() as u32;
+
+    // Shift rectified principal points so the full stereo overlap spans [0..overlap_w, 0..overlap_h]
+    rect_l.cu -= u_min;
+    rect_l.cv -= v_min;
+    rect_r.cu -= u_min;
+    rect_r.cv -= v_min;
+
+    let p_lo_l = rect_l.point_to_pixel(Vec3::new(mid_x, mid_y, ground_z - 25.0));
+    let p_lo_r = rect_r.point_to_pixel(Vec3::new(mid_x, mid_y, ground_z - 25.0));
+    let p_hi_l = rect_l.point_to_pixel(Vec3::new(mid_x, mid_y, ground_z + 25.0));
+    let p_hi_r = rect_r.point_to_pixel(Vec3::new(mid_x, mid_y, ground_z + 25.0));
+    let dx_span = ((p_hi_r.x - p_hi_l.x).abs().max((p_lo_r.x - p_lo_l.x).abs())).round() as i32;
+    let half_span = dx_span.clamp(32, 64);
+
+    let ts = tile_size.clamp(256, 4096);
+    let pad_x = (half_span as u32).min(ts / 6);
+    let pad_y = 24u32.min(ts / 8);
+    let core_w = (ts - 2 * pad_x).max(64);
+    let core_h = (ts - 2 * pad_y).max(64);
+    let tiles_x = (overlap_w + core_w - 1) / core_w;
+    let tiles_y = (overlap_h + core_h - 1) / core_h;
+
+    // Detect which rectified axis aligns with source GeoTIFF rows (Y) so each band reads each Deflate strip ONCE
+    let cu_mid = overlap_w as f64 * 0.5;
+    let cv_mid = overlap_h as f64 * 0.5;
+    let s0 = full_cam_l.point_to_pixel(rect_l.center + rect_l.pixel_to_vector(Vec2::new(cu_mid, cv_mid)) * 1000.0);
+    let su = full_cam_l.point_to_pixel(rect_l.center + rect_l.pixel_to_vector(Vec2::new(cu_mid + 10.0, cv_mid)) * 1000.0);
+    let sv = full_cam_l.point_to_pixel(rect_l.center + rect_l.pixel_to_vector(Vec2::new(cu_mid, cv_mid + 10.0)) * 1000.0);
+    let band_by_tx = (su.y - s0.y).abs() >= (sv.y - s0.y).abs();
+
+    let make_tile = |tx: u32, ty: u32| -> ModelTileSpec {
+        let cx0 = tx * core_w;
+        let cx1 = (cx0 + core_w).min(overlap_w);
+        let cy0 = ty * core_h;
+        let cy1 = (cy0 + core_h).min(overlap_h);
+        let px0 = cx0.saturating_sub(pad_x);
+        let px1 = (cx1 + pad_x).min(overlap_w);
+        let py0 = cy0.saturating_sub(pad_y);
+        let py1 = (cy1 + pad_y).min(overlap_h);
+        ModelTileSpec {
+            tx,
+            ty,
+            px0,
+            py0,
+            tw: px1 - px0,
+            th: py1 - py0,
+            emit_x0: cx0 - px0,
+            emit_y0: cy0 - py0,
+            emit_x1: cx1 - px0,
+            emit_y1: cy1 - py0,
+        }
+    };
+
+    let mut bands = Vec::new();
+    let mut total_tiles = 0usize;
+    if band_by_tx {
+        for tx in 0..tiles_x {
+            let mut band = Vec::with_capacity(tiles_y as usize);
+            for ty in 0..tiles_y {
+                band.push(make_tile(tx, ty));
+            }
+            total_tiles += band.len();
+            bands.push(band);
+        }
+    } else {
+        for ty in 0..tiles_y {
+            let mut band = Vec::with_capacity(tiles_x as usize);
+            for tx in 0..tiles_x {
+                band.push(make_tile(tx, ty));
+            }
+            total_tiles += band.len();
+            bands.push(band);
+        }
+    }
+
+    Ok(FullModelPlan {
+        full_cam_l,
+        full_cam_r,
+        rect_cam_l: rect_l,
+        rect_cam_r: rect_r,
+        full_dims_l: (lw, lh),
+        full_dims_r: (rw, rh),
+        overlap_w,
+        overlap_h,
+        ground_z_ref: ground_z,
+        half_span,
+        tiles_x,
+        tiles_y,
+        bands,
+        total_tiles,
+    })
+}
+
+/// Load the union source bounding box of a strip-band ONCE into RAM (when `<= 450 MB`)
+/// so all ~30 tiles in that band rectify in memory without re-decompressing TIFF strips.
+pub fn load_source_band_for_tiles(
+    reader: &GeoTiffReader,
+    full_cam: &PinholeCamera,
+    rect_base: &PinholeCamera,
+    tiles: &[ModelTileSpec],
+    keep_rgb: bool,
+) -> Result<Option<SourceBandBuffer>> {
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+
+    for tile in tiles {
+        let mut tcam = rect_base.clone();
+        tcam.cu -= tile.px0 as f64;
+        tcam.cv -= tile.py0 as f64;
+        if let Some((x0, y0, sw, sh)) = compute_source_bbox_for_rect_cam(
+            reader.meta.width,
+            reader.meta.height,
+            full_cam,
+            &tcam,
+            tile.tw,
+            tile.th,
+        ) {
+            min_x = min_x.min(x0);
+            min_y = min_y.min(y0);
+            max_x = max_x.max(x0 + sw);
+            max_y = max_y.max(y0 + sh);
+        }
+    }
+
+    if min_x >= max_x || min_y >= max_y {
+        return Ok(None);
+    }
+    let sw = max_x - min_x;
+    let sh = max_y - min_y;
+    let bytes_per_px: u64 = if keep_rgb && reader.meta.samples_per_pixel >= 3 { 7 } else { 4 };
+    let est_bytes = (sw as u64) * (sh as u64) * bytes_per_px;
+    // Cap per-band RAM cache at 450 MB so giant sensors remain memory-safe on all machines
+    if est_bytes > 450 * 1024 * 1024 {
+        return Ok(None);
+    }
+
+    let (gray, rgb) = if keep_rgb {
+        reader.read_roi_with_rgb(min_x, min_y, sw, sh)?
+    } else {
+        (reader.read_roi(min_x, min_y, sw, sh)?, None)
+    };
+    Ok(Some(SourceBandBuffer {
+        x0: min_x,
+        y0: min_y,
+        gray,
+        rgb,
+    }))
+}
+
+/// Rectify one 1:1 tile of a `FullModelPlan` (from cached `SourceBandBuffer` when available,
+/// otherwise streaming directly from disk) and lock its local horizontal disparity search window.
+#[allow(clippy::too_many_arguments)]
+pub fn rectify_full_model_tile(
+    plan: &FullModelPlan,
+    tile: &ModelTileSpec,
+    reader_l: &GeoTiffReader,
+    reader_r: &GeoTiffReader,
+    band_l: Option<&SourceBandBuffer>,
+    band_r: Option<&SourceBandBuffer>,
+    fallback_dx: i32,
+) -> Result<Option<PreparedFullModelTile>> {
+    let (tile_cam_l, tile_cam_r) = plan.tile_cameras(tile);
+    let has_l = compute_source_bbox_for_rect_cam(
+        reader_l.meta.width,
+        reader_l.meta.height,
+        &plan.full_cam_l,
+        &tile_cam_l,
+        tile.tw,
+        tile.th,
+    )
+    .is_some();
+    let has_r = compute_source_bbox_for_rect_cam(
+        reader_r.meta.width,
+        reader_r.meta.height,
+        &plan.full_cam_r,
+        &tile_cam_r,
+        tile.tw,
+        tile.th,
+    )
+    .is_some();
+    if !has_l || !has_r {
+        return Ok(None);
+    }
+
+    let (left_img, left_rgb) = if let Some(bl) = band_l {
+        warp_rectified_from_patch(
+            &bl.gray,
+            bl.rgb.as_ref(),
+            bl.x0,
+            bl.y0,
+            &plan.full_cam_l,
+            &tile_cam_l,
+            tile.tw,
+            tile.th,
+        )
+    } else {
+        let (img, rgb, _) =
+            stream_and_rectify_roi(reader_l, &plan.full_cam_l, &tile_cam_l, tile.tw, tile.th, true)?;
+        (img, rgb)
+    };
+
+    let right_img = if let Some(br) = band_r {
+        warp_rectified_from_patch(
+            &br.gray,
+            None,
+            br.x0,
+            br.y0,
+            &plan.full_cam_r,
+            &tile_cam_r,
+            tile.tw,
+            tile.th,
+        )
+        .0
+    } else {
+        stream_and_rectify_roi(reader_r, &plan.full_cam_r, &tile_cam_r, tile.tw, tile.th, false)?.0
+    };
+
+    // Lock coarse horizontal disparity shift onto local tile terrain (+/- 105 m relief)
+    let coarse_dx = estimate_coarse_epipolar_shift_with_fallback(&left_img, &right_img, 320, fallback_dx);
+    let min_x = (coarse_dx - plan.half_span).clamp(-384, 384);
+    let max_x = (coarse_dx + plan.half_span).clamp(-384, 384);
+
+    Ok(Some(PreparedFullModelTile {
+        left_img,
+        left_rgb,
+        right_img,
+        left_cam: AnyCamera::Pinhole(tile_cam_l),
+        right_cam: AnyCamera::Pinhole(tile_cam_r),
+        search_box: (min_x, 0, max_x, 0),
+        coarse_dx_px: coarse_dx,
+    }))
 }
 
 /// Per-GCP vertical validation detail (`dz_m = z_dem - z_gcp`).
@@ -1357,5 +1833,77 @@ IMG_2 1901500.0 3145250.0 2030.0 0.10 0.20 200.00
         let p_gt = parse_trajectory_str(traj_gt360).unwrap();
         assert!((p_gt[0].kappa_deg - 358.2).abs() < 1e-9);
         assert!((p_gt[1].kappa_deg - 180.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_full_model_overlap_and_tile_partition_exact() {
+        let cal = CameraCalibration::parse_str(
+            "CAMERA;DMCIV 44610;143.0016;-0.0002;0.0084;1742.0;0;0.02;31520;13760;0.003760;0\n",
+        )
+        .unwrap();
+        let p0 = ImagePose {
+            id: "025_0727".into(),
+            x: 1_904_800.953,
+            y: 3_146_730.324,
+            z: 2_024.619,
+            omega_deg: 0.00967,
+            phi_deg: -0.00528,
+            kappa_deg: -40.41325,
+        };
+        let p1 = ImagePose {
+            id: "025_0728".into(),
+            x: 1_904_969.087,
+            y: 3_146_928.945,
+            z: 2_024.280,
+            omega_deg: 0.01362,
+            phi_deg: -0.01243,
+            kappa_deg: -40.41570,
+        };
+        let pair = StereoPairEntry {
+            index: 0,
+            flight_line: 0,
+            name: "L0_025_0727_025_0728".into(),
+            left_pose: p0.clone(),
+            right_pose: p1.clone(),
+            left_image_path: PathBuf::new(),
+            right_image_path: PathBuf::new(),
+            baseline_m: (p1.x - p0.x).hypot(p1.y - p0.y),
+        };
+        let chantier = Chantier {
+            root_dir: PathBuf::new(),
+            input_dir: PathBuf::new(),
+            camera_file: PathBuf::new(),
+            trajectory_file: PathBuf::new(),
+            gcp_file: None,
+            calibration: cal,
+            poses: vec![p0, p1],
+            gcps: vec![GroundControlPoint {
+                id: "G1".into(),
+                x: 1_904_885.0,
+                y: 3_146_829.0,
+                z: 242.0,
+            }],
+            pairs: vec![pair.clone()],
+        };
+
+        let plan = plan_full_model(&chantier, &pair, 31520, 13760, 31520, 13760, 1024).unwrap();
+        // ~60% longitudinal overlap along 13760 px short axis, full ~31520 px across-track
+        assert!(plan.overlap_w > 7000 && plan.overlap_w < 10000, "overlap_w={}", plan.overlap_w);
+        assert!(plan.overlap_h > 29000 && plan.overlap_h < 32000, "overlap_h={}", plan.overlap_h);
+        assert!(plan.total_tiles > 200);
+
+        // Verify emitted core pixels form an EXACT non-overlapping partition of [0..overlap_w x 0..overlap_h]
+        let mut core_pixels = 0u64;
+        let mut count_tiles = 0usize;
+        for band in &plan.bands {
+            for t in band {
+                assert!(t.tw <= 1024 && t.th <= 1024);
+                assert!(t.emit_x1 <= t.tw && t.emit_y1 <= t.th);
+                core_pixels += (t.emit_x1 - t.emit_x0) as u64 * (t.emit_y1 - t.emit_y0) as u64;
+                count_tiles += 1;
+            }
+        }
+        assert_eq!(count_tiles, plan.total_tiles);
+        assert_eq!(core_pixels, plan.overlap_w as u64 * plan.overlap_h as u64);
     }
 }

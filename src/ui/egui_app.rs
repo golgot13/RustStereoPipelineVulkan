@@ -604,6 +604,199 @@ impl StereoEguiApp {
         });
     }
 
+    fn run_chantier_full_model_express(&mut self, ctx: &egui::Context) {
+        if self.is_running() {
+            return;
+        }
+        let dir = Path::new(self.chantier_dir.trim()).to_path_buf();
+        let chantier = match crate::core::chantier::Chantier::discover(&dir) {
+            Ok(c) => c,
+            Err(e) => {
+                self.log(format!("Chantier error: {}", e));
+                return;
+            }
+        };
+        if chantier.pairs.is_empty() {
+            self.log("No stereo pairs detected in chantier".to_string());
+            return;
+        }
+        let idx = self.chantier_pair_idx.min(chantier.pairs.len() - 1);
+        let pair = chantier.pairs[idx].clone();
+
+        self.cancel.reset();
+        let (tx, rx) = mpsc::channel();
+        self.worker_rx = Some(rx);
+        self.progress_frac = 0.01;
+        self.progress_text = format!("Full-Model 1:1 Express: {}", pair.name);
+
+        let engine = Arc::clone(&self.engine);
+        let base_settings = self.job.settings.clone();
+        let tile_size = self.chantier_roi_size;
+        let merge_voxel = self.chantier_merge_voxel;
+        let cancel = self.cancel.clone();
+        let repaint_ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let out_dir = dir.join("Output_stereopipeline");
+            if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                let _ = tx.send(WorkerMsg::Failed(format!("Cannot create output dir: {}", e)));
+                repaint_ctx.request_repaint();
+                return;
+            }
+            let reader_l = match crate::image::geotiff::GeoTiffReader::open(&pair.left_image_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::Failed(e.to_string()));
+                    repaint_ctx.request_repaint();
+                    return;
+                }
+            };
+            let reader_r = match crate::image::geotiff::GeoTiffReader::open(&pair.right_image_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::Failed(e.to_string()));
+                    repaint_ctx.request_repaint();
+                    return;
+                }
+            };
+            let plan = match crate::core::chantier::plan_full_model(
+                &chantier,
+                &pair,
+                reader_l.meta.width,
+                reader_l.meta.height,
+                reader_r.meta.width,
+                reader_r.meta.height,
+                tile_size,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::Failed(e.to_string()));
+                    repaint_ctx.request_repaint();
+                    return;
+                }
+            };
+            let ply_path = out_dir.join(format!("{}-FULL-PC.ply", pair.name));
+            let mut merger = match crate::image::io::PointCloudMerger::new(&ply_path, merge_voxel) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::Failed(e.to_string()));
+                    repaint_ctx.request_repaint();
+                    return;
+                }
+            };
+
+            let t0 = std::time::Instant::now();
+            let mut done = 0usize;
+            let mut prev_dx = 0i32;
+            for band in &plan.bands {
+                let band_l = crate::core::chantier::load_source_band_for_tiles(
+                    &reader_l,
+                    &plan.full_cam_l,
+                    &plan.rect_cam_l,
+                    band,
+                    true,
+                )
+                .ok()
+                .flatten();
+                let band_r = crate::core::chantier::load_source_band_for_tiles(
+                    &reader_r,
+                    &plan.full_cam_r,
+                    &plan.rect_cam_r,
+                    band,
+                    false,
+                )
+                .ok()
+                .flatten();
+
+                for tile in band {
+                    if cancel.is_cancelled() {
+                        let _ = tx.send(WorkerMsg::Failed("Cancelled by user".to_string()));
+                        repaint_ctx.request_repaint();
+                        return;
+                    }
+                    let _ = tx.send(WorkerMsg::Progress(
+                        format!("Full-Model {} tile {}/{}", pair.name, done + 1, plan.total_tiles),
+                        done as f32 / plan.total_tiles.max(1) as f32,
+                    ));
+                    repaint_ctx.request_repaint();
+
+                    let prep = match crate::core::chantier::rectify_full_model_tile(
+                        &plan,
+                        tile,
+                        &reader_l,
+                        &reader_r,
+                        band_l.as_ref(),
+                        band_r.as_ref(),
+                        prev_dx,
+                    ) {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            done += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(WorkerMsg::Failed(e.to_string()));
+                            repaint_ctx.request_repaint();
+                            return;
+                        }
+                    };
+                    let mut s = base_settings.clone();
+                    s.search_min_x = prep.search_box.0;
+                    s.search_min_y = prep.search_box.1;
+                    s.search_max_x = prep.search_box.2;
+                    s.search_max_y = prep.search_box.3;
+                    let out = engine.run_express_tile(
+                        &prep.left_img,
+                        prep.left_rgb.as_ref(),
+                        &prep.right_img,
+                        &prep.left_cam,
+                        &prep.right_cam,
+                        &s,
+                    );
+                    if let Some(mdx) = out.median_dx {
+                        if out.valid_pct >= 25.0 {
+                            prev_dx = mdx.round() as i32;
+                        }
+                    }
+                    if let Err(e) = merger.add_point_cloud_rect(
+                        &out.point_cloud,
+                        tile.emit_x0,
+                        tile.emit_y0,
+                        tile.emit_x1,
+                        tile.emit_y1,
+                    ) {
+                        let _ = tx.send(WorkerMsg::Failed(e.to_string()));
+                        repaint_ctx.request_repaint();
+                        return;
+                    }
+                    done += 1;
+                }
+            }
+
+            match merger.finish() {
+                Ok(st) => {
+                    let secs = t0.elapsed().as_secs_f64();
+                    let _ = tx.send(WorkerMsg::Log(format!(
+                        "Full-Model Express {} done in {:.1}s: {} ({} pts, {:.1} MB)",
+                        pair.name,
+                        secs,
+                        ply_path.display(),
+                        st.vertex_count,
+                        st.file_size_bytes as f64 / (1024.0 * 1024.0)
+                    )));
+                    let _ = tx.send(WorkerMsg::Failed(format!(
+                        "Full-Model Express complete ({:.1}s, {} pts)",
+                        secs, st.vertex_count
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::Failed(e.to_string()));
+                }
+            }
+            repaint_ctx.request_repaint();
+        });
+    }
+
     fn load_job_file(&mut self, ctx: &egui::Context) {
         match JobSpec::load_file(Path::new(self.job_file_path.trim())) {
             Ok(mut spec) => {
@@ -864,6 +1057,12 @@ impl eframe::App for StereoEguiApp {
                                 .clicked()
                             {
                                 self.load_chantier_pair(ctx);
+                            }
+                            if ui
+                                .add_enabled(!self.is_running(), egui::Button::new("Full Model 1:1 Express (Pair # -> RGB PLY)"))
+                                .clicked()
+                            {
+                                self.run_chantier_full_model_express(ctx);
                             }
                             if ui
                                 .add_enabled(!self.is_running(), egui::Button::new("Run All Pairs & Merge RGB PLY"))

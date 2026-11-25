@@ -840,23 +840,43 @@ impl StreamingPlyWriter {
     }
 
     pub fn append_point_cloud(&mut self, pc: &PointCloud) -> io::Result<usize> {
+        self.append_point_cloud_rect(pc, 0, 0, pc.width, pc.height)
+    }
+
+    pub fn append_point_cloud_rect(
+        &mut self,
+        pc: &PointCloud,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    ) -> io::Result<usize> {
         let mut added = 0usize;
+        let w = pc.width as usize;
+        let rx0 = (x0 as usize).min(w);
+        let rx1 = (x1 as usize).min(w);
+        let ry0 = (y0 as usize).min(pc.height as usize);
+        let ry1 = (y1 as usize).min(pc.height as usize);
         let colors = pc.colors.as_deref();
-        for i in 0..pc.points.len() {
-            if pc.valid[i] != 0 {
-                let p = pc.points[i];
-                if !p.is_finite() {
-                    continue;
-                }
-                let rgb = match colors.and_then(|c| c.get(i)) {
-                    Some(&c) => c,
-                    None => {
-                        let g = (pc.intensities[i].clamp(0.0, 1.0) * 255.0).round() as u8;
-                        [g, g, g]
+        for y in ry0..ry1 {
+            let row = y * w;
+            for x in rx0..rx1 {
+                let i = row + x;
+                if pc.valid[i] != 0 {
+                    let p = pc.points[i];
+                    if !p.is_finite() {
+                        continue;
                     }
-                };
-                self.append_vertex(p, rgb, pc.errors[i])?;
-                added += 1;
+                    let rgb = match colors.and_then(|c| c.get(i)) {
+                        Some(&c) => c,
+                        None => {
+                            let g = (pc.intensities[i].clamp(0.0, 1.0) * 255.0).round() as u8;
+                            [g, g, g]
+                        }
+                    };
+                    self.append_vertex(p, rgb, pc.errors[i])?;
+                    added += 1;
+                }
             }
         }
         Ok(added)
@@ -947,23 +967,43 @@ impl VoxelCloudMerger {
     }
 
     pub fn add_point_cloud(&mut self, pc: &PointCloud) -> usize {
+        self.add_point_cloud_rect(pc, 0, 0, pc.width, pc.height)
+    }
+
+    pub fn add_point_cloud_rect(
+        &mut self,
+        pc: &PointCloud,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    ) -> usize {
         let mut added = 0usize;
+        let w = pc.width as usize;
+        let rx0 = (x0 as usize).min(w);
+        let rx1 = (x1 as usize).min(w);
+        let ry0 = (y0 as usize).min(pc.height as usize);
+        let ry1 = (y1 as usize).min(pc.height as usize);
         let colors = pc.colors.as_deref();
-        for i in 0..pc.points.len() {
-            if pc.valid[i] != 0 {
-                let p = pc.points[i];
-                if !p.is_finite() {
-                    continue;
-                }
-                let rgb = match colors.and_then(|c| c.get(i)) {
-                    Some(&c) => c,
-                    None => {
-                        let g = (pc.intensities[i].clamp(0.0, 1.0) * 255.0).round() as u8;
-                        [g, g, g]
+        for y in ry0..ry1 {
+            let row = y * w;
+            for x in rx0..rx1 {
+                let i = row + x;
+                if pc.valid[i] != 0 {
+                    let p = pc.points[i];
+                    if !p.is_finite() {
+                        continue;
                     }
-                };
-                self.add_vertex(p, rgb, pc.errors[i]);
-                added += 1;
+                    let rgb = match colors.and_then(|c| c.get(i)) {
+                        Some(&c) => c,
+                        None => {
+                            let g = (pc.intensities[i].clamp(0.0, 1.0) * 255.0).round() as u8;
+                            [g, g, g]
+                        }
+                    };
+                    self.add_vertex(p, rgb, pc.errors[i]);
+                    added += 1;
+                }
             }
         }
         added
@@ -1017,9 +1057,20 @@ impl PointCloudMerger {
     }
 
     pub fn add_point_cloud(&mut self, pc: &PointCloud) -> io::Result<usize> {
+        self.add_point_cloud_rect(pc, 0, 0, pc.width, pc.height)
+    }
+
+    pub fn add_point_cloud_rect(
+        &mut self,
+        pc: &PointCloud,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    ) -> io::Result<usize> {
         match self {
-            Self::Streaming(w) => w.append_point_cloud(pc),
-            Self::Voxel { merger, .. } => Ok(merger.add_point_cloud(pc)),
+            Self::Streaming(w) => w.append_point_cloud_rect(pc, x0, y0, x1, y1),
+            Self::Voxel { merger, .. } => Ok(merger.add_point_cloud_rect(pc, x0, y0, x1, y1)),
         }
     }
 
