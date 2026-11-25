@@ -528,6 +528,12 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| root_path.join("Output_stereopipeline"));
     std::fs::create_dir_all(&out_dir)?;
 
+    if !p.ndjson {
+        use std::io::Write;
+        println!("[Chantier] Analyse de {} ...", root_path.display());
+        let _ = std::io::stdout().flush();
+    }
+
     let chantier = Chantier::discover_with_opts(
         root_path,
         p.gcp_picks_path.as_deref().map(Path::new),

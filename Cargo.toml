@@ -17,12 +17,13 @@ path = "src/main.rs"
 default = ["egui-ui", "laz-lidar"]
 # Optional egui/eframe desktop UI; compile with `--no-default-features` for 100% zero external crates
 egui-ui = ["dep:eframe"]
-# Optional pure-Rust LAS/LAZ LiDAR HD reader for IGN_DATA local MNT/MNS terrain guidance
-laz-lidar = ["dep:las"]
+# Optional pure-Rust LAS/LAZ/COPC LiDAR HD reader for IGN_DATA local MNT/MNS terrain guidance
+laz-lidar = ["dep:las", "dep:laz"]
 
 [dependencies]
 eframe = { version = "0.31", optional = true }
 las = { version = "0.9", features = ["laz"], optional = true }
+laz = { version = "0.12", optional = true }
 
 [profile.release]
 opt-level = 3

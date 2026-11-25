@@ -358,6 +358,300 @@ fn fill_small_gaps(grid: &mut [f32], w: usize, h: usize, passes: usize) {
     }
 }
 
+#[cfg(feature = "laz-lidar")]
+fn vlr_user_id_str(bytes: &[u8; 16]) -> &str {
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..len]).unwrap_or("")
+}
+
+#[cfg(feature = "laz-lidar")]
+struct TileAccum {
+    ox: usize,
+    oy: usize,
+    tw: usize,
+    th: usize,
+    g_min_x: f64,
+    g_min_y: f64,
+    inv_cs: f64,
+    sx: f64,
+    sy: f64,
+    sz: f64,
+    ox_t: f64,
+    oy_t: f64,
+    oz_t: f64,
+    is_las14_fmt: bool,
+    sum_g: Vec<f64>,
+    cnt_g: Vec<u32>,
+    sum_s: Vec<f64>,
+    cnt_s: Vec<u32>,
+    points_used: usize,
+}
+
+#[cfg(feature = "laz-lidar")]
+impl TileAccum {
+    #[inline(always)]
+    fn push_record(&mut self, rec: &[u8]) {
+        if rec.len() < 17 {
+            return;
+        }
+        let cls = if self.is_las14_fmt {
+            rec[16]
+        } else {
+            rec[15] & 0x1F
+        };
+        // Skip ASPRS Low Noise (7) and High Noise (18)
+        if cls == 7 || cls == 18 {
+            return;
+        }
+        let rx = i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+        let ry = i32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+        let rz = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+        let x = rx as f64 * self.sx + self.ox_t;
+        let y = ry as f64 * self.sy + self.oy_t;
+        let z = rz as f64 * self.sz + self.oz_t;
+        if !z.is_finite() {
+            return;
+        }
+        let gx = ((x - self.g_min_x) * self.inv_cs).floor() as isize;
+        let gy = ((y - self.g_min_y) * self.inv_cs).floor() as isize;
+        if gx < self.ox as isize
+            || gx >= (self.ox + self.tw) as isize
+            || gy < self.oy as isize
+            || gy >= (self.oy + self.th) as isize
+        {
+            return;
+        }
+        let li = (gy as usize - self.oy) * self.tw + (gx as usize - self.ox);
+        self.sum_s[li] += z;
+        self.cnt_s[li] = self.cnt_s[li].saturating_add(1);
+        if cls == 2 {
+            // ASPRS Class 2 = Ground (MNT)
+            self.sum_g[li] += z;
+            self.cnt_g[li] = self.cnt_g[li].saturating_add(1);
+        }
+        self.points_used += 1;
+    }
+}
+
+/// Ultra-fast COPC 1.0 octree LOD reader (`level <= 4`, capped at ~450k uniformly spaced points/tile)
+/// using selective LAZ decompression (`XYZ + Classification` only, skipping GPS/RGB/NIR/Intensity).
+#[cfg(feature = "laz-lidar")]
+fn rasterize_copc_lod(
+    file: &mut File,
+    copc_vlr_data: &[u8],
+    laz_vlr: &laz::LazVlr,
+    accum: &mut TileAccum,
+) -> bool {
+    use laz::record::{LayeredPointRecordDecompressor, RecordDecompressor};
+    use laz::DecompressionSelection;
+    use std::io::{Cursor, Seek, SeekFrom};
+
+    if copc_vlr_data.len() < 152 {
+        return false;
+    }
+    let root_hier_offset = u64::from_le_bytes(copc_vlr_data[136..144].try_into().unwrap());
+    let root_hier_size = u64::from_le_bytes(copc_vlr_data[144..152].try_into().unwrap());
+    if root_hier_size < 32 || root_hier_size > 16 * 1024 * 1024 {
+        return false;
+    }
+
+    #[derive(Clone, Copy)]
+    struct CopcNode {
+        level: i32,
+        offset: u64,
+        byte_size: usize,
+        point_count: usize,
+    }
+
+    let max_level = 4i32;
+    let mut nodes: Vec<CopcNode> = Vec::new();
+    let mut pages: Vec<(u64, usize)> = vec![(root_hier_offset, root_hier_size as usize)];
+    let mut pages_visited = 0usize;
+    let mut page_buf = Vec::new();
+
+    while let Some((p_off, p_sz)) = pages.pop() {
+        if pages_visited >= 64 || p_sz < 32 || p_sz > 8 * 1024 * 1024 {
+            continue;
+        }
+        pages_visited += 1;
+        if file.seek(SeekFrom::Start(p_off)).is_err() {
+            continue;
+        }
+        page_buf.resize(p_sz, 0u8);
+        if file.read_exact(&mut page_buf).is_err() {
+            continue;
+        }
+        for entry in page_buf.chunks_exact(32) {
+            let level = i32::from_le_bytes(entry[0..4].try_into().unwrap());
+            let offset = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+            let byte_size = i32::from_le_bytes(entry[24..28].try_into().unwrap());
+            let point_count = i32::from_le_bytes(entry[28..32].try_into().unwrap());
+            if byte_size <= 0 || level < 0 || level > max_level {
+                continue;
+            }
+            if point_count == -1 {
+                pages.push((offset, byte_size as usize));
+            } else if point_count > 0 {
+                nodes.push(CopcNode {
+                    level,
+                    offset,
+                    byte_size: byte_size as usize,
+                    point_count: point_count as usize,
+                });
+            }
+        }
+    }
+
+    if nodes.is_empty() {
+        return false;
+    }
+    // Process breadth-first (level 0, 1, 2, 3, 4) and sequential by file offset within each level
+    nodes.sort_by_key(|n| (n.level, n.offset));
+
+    let sel = DecompressionSelection(
+        DecompressionSelection::Z | DecompressionSelection::CLASSIFICATION,
+    );
+    let rec_size = laz_vlr.items_size() as usize;
+    if rec_size < 17 {
+        return false;
+    }
+    let mut rec_buf = vec![0u8; rec_size];
+    let mut comp_buf = Vec::new();
+    let max_pts_per_tile = 450_000usize;
+    let mut total_decoded = 0usize;
+
+    for node in nodes {
+        if total_decoded >= max_pts_per_tile && node.level >= 2 {
+            break;
+        }
+        if node.byte_size > 32 * 1024 * 1024 {
+            continue;
+        }
+        if file.seek(SeekFrom::Start(node.offset)).is_err() {
+            continue;
+        }
+        comp_buf.resize(node.byte_size, 0u8);
+        if file.read_exact(&mut comp_buf).is_err() {
+            continue;
+        }
+        let mut dec = LayeredPointRecordDecompressor::new(Cursor::new(comp_buf.as_slice()));
+        if dec.set_fields_from(laz_vlr.items()).is_err() {
+            return false;
+        }
+        dec.set_selection(sel);
+        for _ in 0..node.point_count {
+            if dec.decompress_next(&mut rec_buf).is_err() {
+                break;
+            }
+            accum.push_record(&rec_buf);
+            total_decoded += 1;
+        }
+    }
+
+    accum.points_used > 0
+}
+
+/// Fast selective chunk-strided LAZ reader for non-COPC `.laz` files (`XYZ + Classification` only).
+#[cfg(feature = "laz-lidar")]
+fn rasterize_laz_selective(
+    mut file: File,
+    point_data_offset: u64,
+    total_pts: u64,
+    laz_vlr: laz::LazVlr,
+    accum: &mut TileAccum,
+) -> bool {
+    use laz::{DecompressionSelection, LasZipDecompressor};
+    use std::io::{Seek, SeekFrom};
+
+    if file.seek(SeekFrom::Start(point_data_offset)).is_err() {
+        return false;
+    }
+    let sel = DecompressionSelection(
+        DecompressionSelection::Z | DecompressionSelection::CLASSIFICATION,
+    );
+    let rec_size = laz_vlr.items_size() as usize;
+    if rec_size < 17 {
+        return false;
+    }
+    let fixed_chunk_sz = if !laz_vlr.uses_variable_size_chunks() && laz_vlr.chunk_size() > 0 {
+        Some(laz_vlr.chunk_size() as u64)
+    } else {
+        None
+    };
+
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    let Ok(mut dec) = LasZipDecompressor::selective(reader, laz_vlr, sel) else {
+        return false;
+    };
+    let mut rec_buf = vec![0u8; rec_size];
+    let target_pts = 450_000u64;
+
+    if let Some(cs) = fixed_chunk_sz.filter(|_| total_pts > target_pts) {
+        let n_chunks = (total_pts + cs - 1) / cs;
+        let pts_per_chunk = (target_pts / n_chunks.max(1)).clamp(512, cs);
+        for c in 0..n_chunks {
+            if c > 0 && dec.seek(c * cs).is_err() {
+                break;
+            }
+            let n_read = pts_per_chunk.min(total_pts.saturating_sub(c * cs));
+            for _ in 0..n_read {
+                if dec.decompress_one(&mut rec_buf).is_err() {
+                    break;
+                }
+                accum.push_record(&rec_buf);
+            }
+        }
+    } else {
+        let n_read = total_pts.min(600_000);
+        for _ in 0..n_read {
+            if dec.decompress_one(&mut rec_buf).is_err() {
+                break;
+            }
+            accum.push_record(&rec_buf);
+        }
+    }
+
+    accum.points_used > 0
+}
+
+/// Fast strided raw reader for uncompressed `.las` files.
+#[cfg(feature = "laz-lidar")]
+fn rasterize_las_raw(
+    mut file: File,
+    point_data_offset: u64,
+    total_pts: u64,
+    rec_len: usize,
+    accum: &mut TileAccum,
+) -> bool {
+    use std::io::{Seek, SeekFrom};
+
+    if rec_len < 17 || file.seek(SeekFrom::Start(point_data_offset)).is_err() {
+        return false;
+    }
+    let step = (total_pts / 450_000).max(1);
+    let mut rec_buf = vec![0u8; rec_len];
+    if step == 1 {
+        let mut r = BufReader::with_capacity(256 * 1024, file);
+        for _ in 0..total_pts {
+            if r.read_exact(&mut rec_buf).is_err() {
+                break;
+            }
+            accum.push_record(&rec_buf);
+        }
+    } else {
+        let mut idx = 0u64;
+        while idx < total_pts {
+            let off = point_data_offset + idx * rec_len as u64;
+            if file.seek(SeekFrom::Start(off)).is_err() || file.read_exact(&mut rec_buf).is_err() {
+                break;
+            }
+            accum.push_record(&rec_buf);
+            idx += step;
+        }
+    }
+    accum.points_used > 0
+}
+
 /// Load or build a compact `4.0 m` MNT + MNS `LidarTerrainModel` from `.laz`/`.las` files in `ign_dir`,
 /// intersecting the survey bounding box `(survey_min_x..survey_max_x, survey_min_y..survey_max_y)` in `survey_crs`.
 #[cfg(feature = "laz-lidar")]
@@ -367,15 +661,17 @@ pub fn load_ign_lidar_mnt(
     survey_bbox: (f64, f64, f64, f64),
     survey_crs: CrsId,
 ) -> Result<Option<LidarTerrainModel>> {
-    use las::Reader;
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let t_start = std::time::Instant::now();
     let mut all_laz = Vec::new();
     collect_laz_files(ign_dir, 2, &mut all_laz);
     if all_laz.is_empty() {
         return Ok(None);
     }
 
-    // 1. Header-only bounding-box scan (< 1 ms per file)
+    // 1. Instant 375-byte raw LAS header bounding-box scan (< 0.1 ms per file!)
     struct TileHeaderInfo {
         path: PathBuf,
         min_x: f64,
@@ -386,22 +682,31 @@ pub fn load_ign_lidar_mnt(
     let mut headers = Vec::new();
     let mut detected_lidar_crs: Option<CrsId> = None;
     for path in &all_laz {
-        let Ok(reader) = Reader::from_path(path) else {
+        let Ok(mut f) = File::open(path) else {
             continue;
         };
-        let b = reader.header().bounds();
-        if !b.min.x.is_finite() || !b.max.x.is_finite() || b.max.x <= b.min.x || b.max.y <= b.min.y {
+        let Ok(raw_hdr) = las::raw::Header::read_from(&mut f) else {
+            continue;
+        };
+        if !raw_hdr.min_x.is_finite()
+            || !raw_hdr.max_x.is_finite()
+            || raw_hdr.max_x <= raw_hdr.min_x
+            || raw_hdr.max_y <= raw_hdr.min_y
+        {
             continue;
         }
         if detected_lidar_crs.is_none() {
-            detected_lidar_crs = CrsId::guess_french_from_xy(0.5 * (b.min.x + b.max.x), 0.5 * (b.min.y + b.max.y));
+            detected_lidar_crs = CrsId::guess_french_from_xy(
+                0.5 * (raw_hdr.min_x + raw_hdr.max_x),
+                0.5 * (raw_hdr.min_y + raw_hdr.max_y),
+            );
         }
         headers.push(TileHeaderInfo {
             path: path.clone(),
-            min_x: b.min.x,
-            max_x: b.max.x,
-            min_y: b.min.y,
-            max_y: b.max.y,
+            min_x: raw_hdr.min_x,
+            max_x: raw_hdr.max_x,
+            min_y: raw_hdr.min_y,
+            max_y: raw_hdr.max_y,
         });
     }
     if headers.is_empty() {
@@ -409,9 +714,9 @@ pub fn load_ign_lidar_mnt(
     }
     let lidar_crs = detected_lidar_crs.unwrap_or(survey_crs);
 
-    // Transform survey bbox (+ 1500 m margin for wide sensor footprints) into lidar_crs
+    // Transform survey bbox (+ 900 m margin covering full DMC-IV half-footprint) into lidar_crs
     let (sx0, sx1, sy0, sy1) = survey_bbox;
-    let margin = 1500.0;
+    let margin = 900.0;
     let survey_corners = [
         Vec3::new(sx0 - margin, sy0 - margin, 0.0),
         Vec3::new(sx1 + margin, sy0 - margin, 0.0),
@@ -453,6 +758,16 @@ pub fn load_ign_lidar_mnt(
         }
     }
 
+    eprintln!(
+        "[LiDAR HD] {}/{} dalles .laz intersectent le chantier ({} -> {}) — construction MNT/MNS @{:.1} m...",
+        intersecting.len(),
+        headers.len(),
+        lidar_crs.code(),
+        survey_crs.code(),
+        cell_size
+    );
+    let _ = std::io::stderr().flush();
+
     // 3. Compute unified raster extent (clipped to survey query bbox + 200 m so RAM stays tiny)
     let mut g_min_x = f64::INFINITY;
     let mut g_max_x = f64::NEG_INFINITY;
@@ -473,7 +788,7 @@ pub fn load_ign_lidar_mnt(
     let height = (((g_max_y - g_min_y) / cell_size).ceil() as usize + 1).clamp(16, 8192);
     let n_cells = width * height;
 
-    // 4. Parallel streaming LAZ rasterization (one compact local grid per tile, O(1) point memory!)
+    // 4. Parallel COPC LOD / selective LAZ rasterization (capped at 4 threads to avoid HDD seek thrashing!)
     struct LocalTileGrid {
         ox: usize,
         oy: usize,
@@ -485,17 +800,22 @@ pub fn load_ign_lidar_mnt(
         cnt_s: Vec<u32>,
     }
 
+    let n_tiles = intersecting.len();
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .clamp(1, intersecting.len());
-    let per_thread = (intersecting.len() + n_threads - 1) / n_threads;
-    let mut tile_results: Vec<Option<LocalTileGrid>> = (0..intersecting.len()).map(|_| None).collect();
+        .min(4)
+        .clamp(1, n_tiles);
+    let per_thread = (n_tiles + n_threads - 1) / n_threads;
+    let mut tile_results: Vec<Option<LocalTileGrid>> = (0..n_tiles).map(|_| None).collect();
+    let done_counter = AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
         for (h_chunk, r_chunk) in intersecting.chunks(per_thread).zip(tile_results.chunks_mut(per_thread)) {
+            let done_ref = &done_counter;
             scope.spawn(move || {
                 for (info, slot) in h_chunk.iter().zip(r_chunk.iter_mut()) {
+                    let t_tile = std::time::Instant::now();
                     let tx0 = (((info.min_x - g_min_x) / cell_size).floor() as isize).clamp(0, (width - 1) as isize) as usize;
                     let tx1 = (((info.max_x - g_min_x) / cell_size).ceil() as isize).clamp(tx0 as isize, (width - 1) as isize) as usize;
                     let ty0 = (((info.min_y - g_min_y) / cell_size).floor() as isize).clamp(0, (height - 1) as isize) as usize;
@@ -504,48 +824,106 @@ pub fn load_ign_lidar_mnt(
                     let th = ty1 - ty0 + 1;
                     let tn = tw * th;
 
-                    let Ok(mut reader) = Reader::from_path(&info.path) else {
+                    let Ok(mut file) = File::open(&info.path) else {
                         continue;
                     };
-                    let mut sum_g = vec![0.0f64; tn];
-                    let mut cnt_g = vec![0u32; tn];
-                    let mut sum_s = vec![0.0f64; tn];
-                    let mut cnt_s = vec![0u32; tn];
-                    let inv_cs = 1.0 / cell_size;
-
-                    for pt_res in reader.points() {
-                        let Ok(pt) = pt_res else {
+                    let Ok(raw_hdr) = las::raw::Header::read_from(&mut file) else {
+                        continue;
+                    };
+                    let mut copc_vlr_data: Option<Vec<u8>> = None;
+                    let mut laz_vlr: Option<laz::LazVlr> = None;
+                    for _ in 0..raw_hdr.number_of_variable_length_records {
+                        let Ok(vlr) = las::raw::Vlr::read_from(&mut file, false) else {
                             break;
                         };
-                        let cls: u8 = pt.classification.into();
-                        // Skip ASPRS Low Noise (7) and High Noise (18)
-                        if cls == 7 || cls == 18 || !pt.z.is_finite() {
-                            continue;
-                        }
-                        let gx = ((pt.x - g_min_x) * inv_cs).floor() as isize;
-                        let gy = ((pt.y - g_min_y) * inv_cs).floor() as isize;
-                        if gx < tx0 as isize || gx > tx1 as isize || gy < ty0 as isize || gy > ty1 as isize {
-                            continue;
-                        }
-                        let li = (gy as usize - ty0) * tw + (gx as usize - tx0);
-                        sum_s[li] += pt.z;
-                        cnt_s[li] = cnt_s[li].saturating_add(1);
-                        if cls == 2 {
-                            // ASPRS Class 2 = Ground (MNT)
-                            sum_g[li] += pt.z;
-                            cnt_g[li] = cnt_g[li].saturating_add(1);
+                        let uid = vlr_user_id_str(&vlr.user_id);
+                        if uid.eq_ignore_ascii_case("copc") && vlr.record_id == 1 {
+                            copc_vlr_data = Some(vlr.data);
+                        } else if uid.eq_ignore_ascii_case("laszip encoded") && vlr.record_id == 22204 {
+                            laz_vlr = laz::LazVlr::read_from(Cursor::new(&vlr.data)).ok();
                         }
                     }
+
+                    let is_compressed = (raw_hdr.point_data_record_format & 0x80) != 0;
+                    let fmt_id = raw_hdr.point_data_record_format & 0x3F;
+                    let total_pts = raw_hdr
+                        .large_file
+                        .map(|lf| lf.number_of_point_records)
+                        .unwrap_or(raw_hdr.number_of_point_records as u64);
+
+                    let mut accum = TileAccum {
+                        ox: tx0,
+                        oy: ty0,
+                        tw,
+                        th,
+                        g_min_x,
+                        g_min_y,
+                        inv_cs: 1.0 / cell_size,
+                        sx: raw_hdr.x_scale_factor,
+                        sy: raw_hdr.y_scale_factor,
+                        sz: raw_hdr.z_scale_factor,
+                        ox_t: raw_hdr.x_offset,
+                        oy_t: raw_hdr.y_offset,
+                        oz_t: raw_hdr.z_offset,
+                        is_las14_fmt: fmt_id >= 6,
+                        sum_g: vec![0.0f64; tn],
+                        cnt_g: vec![0u32; tn],
+                        sum_s: vec![0.0f64; tn],
+                        cnt_s: vec![0u32; tn],
+                        points_used: 0,
+                    };
+
+                    let mut mode_label = "LAS";
+                    if is_compressed {
+                        if let Some(lv) = laz_vlr {
+                            let copc_ok = copc_vlr_data
+                                .as_deref()
+                                .map_or(false, |cd| rasterize_copc_lod(&mut file, cd, &lv, &mut accum));
+                            if copc_ok {
+                                mode_label = "COPC LOD";
+                            } else {
+                                mode_label = "LAZ sélectif";
+                                let _ = rasterize_laz_selective(
+                                    file,
+                                    raw_hdr.offset_to_point_data as u64,
+                                    total_pts,
+                                    lv,
+                                    &mut accum,
+                                );
+                            }
+                        }
+                    } else {
+                        let _ = rasterize_las_raw(
+                            file,
+                            raw_hdr.offset_to_point_data as u64,
+                            total_pts,
+                            raw_hdr.point_data_record_length as usize,
+                            &mut accum,
+                        );
+                    }
+
+                    let done = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    let fname = info.path.file_name().and_then(|n| n.to_str()).unwrap_or("tile.laz");
+                    eprintln!(
+                        "[LiDAR HD]   [{:>2}/{}] {} ({}: {} pts en {:.0} ms)",
+                        done,
+                        n_tiles,
+                        fname,
+                        mode_label,
+                        accum.points_used,
+                        t_tile.elapsed().as_secs_f64() * 1000.0
+                    );
+                    let _ = std::io::stderr().flush();
 
                     *slot = Some(LocalTileGrid {
                         ox: tx0,
                         oy: ty0,
                         tw,
                         th,
-                        sum_g,
-                        cnt_g,
-                        sum_s,
-                        cnt_s,
+                        sum_g: accum.sum_g,
+                        cnt_g: accum.cnt_g,
+                        sum_s: accum.sum_s,
+                        cnt_s: accum.cnt_s,
                     });
                 }
             });
@@ -591,7 +969,7 @@ pub fn load_ign_lidar_mnt(
             if zg > z_max { z_max = zg; }
         }
     }
-    // Fill small building/water ground gaps (4 passes), then fall back to surface where still missing
+    // Fill small building/water ground gaps, then fall back to surface where still missing
     fill_small_gaps(&mut z_ground, width, height, 6);
     fill_small_gaps(&mut z_surface, width, height, 4);
     for i in 0..n_cells {
@@ -622,6 +1000,14 @@ pub fn load_ign_lidar_mnt(
     if let Some(cp) = cache_path {
         let _ = model.save_cache(cp, fp);
     }
+
+    eprintln!(
+        "[LiDAR HD] MNT/MNS assemblé en {:.2} s (Z=[{:.1}..{:.1}] m, cache sauvegardé)",
+        t_start.elapsed().as_secs_f64(),
+        z_min,
+        z_max
+    );
+    let _ = std::io::stderr().flush();
 
     Ok(Some(model))
 }
@@ -699,5 +1085,90 @@ mod tests {
         assert_eq!(loaded.lidar_crs, CrsId::Lambert93);
         let z_loaded = loaded.sample_ground_z(cc44_pt.x, cc44_pt.y, CrsId::CcZone(44)).unwrap();
         assert!((z_loaded - z_g).abs() < 1e-4);
+    }
+
+    #[cfg(feature = "laz-lidar")]
+    #[test]
+    fn test_laz_v14_selective_decompression_end_to_end() {
+        use las::point::Classification;
+        use las::{Builder, Point, Version, Writer};
+
+        let test_dir = std::env::temp_dir().join("rspv_test_ign_laz_e2e");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let laz_path = test_dir.join("LHD_FXX_0899_6268_TEST.laz");
+        let cache_path = test_dir.join("mnt_cache.bin");
+
+        // Build a real LAS 1.4 PDRF 6 compressed .laz tile (exact IGN LiDAR HD point format!)
+        let mut builder = Builder::from((1, 4));
+        builder.version = Version::new(1, 4);
+        builder.point_format = las::point::Format::new(6).unwrap();
+        builder.point_format.is_compressed = true;
+        builder.transforms.x.scale = 0.001;
+        builder.transforms.y.scale = 0.001;
+        builder.transforms.z.scale = 0.001;
+        builder.transforms.x.offset = 899_000.0;
+        builder.transforms.y.offset = 6_268_000.0;
+        builder.transforms.z.offset = 0.0;
+        let header = builder.into_header().unwrap();
+        {
+            let mut writer = Writer::from_path(&laz_path, header).unwrap();
+            for iy in 0..30 {
+                for ix in 0..30 {
+                    let x = 899_000.0 + ix as f64 * 4.0 + 1.0;
+                    let y = 6_268_000.0 + iy as f64 * 4.0 + 1.0;
+                    let z_ground = 240.0 + 0.05 * (x - 899_000.0);
+                    // Class 2 Ground point
+                    let mut pg = Point::default();
+                    pg.x = x;
+                    pg.y = y;
+                    pg.z = z_ground;
+                    pg.gps_time = Some(1234.5);
+                    pg.classification = Classification::Ground;
+                    writer.write_point(pg).unwrap();
+                    // Class 6 Building roof (+10 m above ground)
+                    let mut pb = Point::default();
+                    pb.x = x;
+                    pb.y = y;
+                    pb.z = z_ground + 10.0;
+                    pb.gps_time = Some(1234.6);
+                    pb.classification = Classification::Building;
+                    writer.write_point(pb).unwrap();
+                    // Class 7 Low Noise (-100 m outlier, must be rejected!)
+                    let mut pn = Point::default();
+                    pn.x = x;
+                    pn.y = y;
+                    pn.z = z_ground - 100.0;
+                    pn.gps_time = Some(1234.7);
+                    pn.classification = Classification::LowPoint;
+                    writer.write_point(pn).unwrap();
+                }
+            }
+            writer.close().unwrap();
+        }
+
+        let bbox = (899_000.0, 899_120.0, 6_268_000.0, 6_268_120.0);
+        let mnt = load_ign_lidar_mnt(&test_dir, Some(&cache_path), bbox, CrsId::Lambert93)
+            .unwrap()
+            .expect("expected LidarTerrainModel from .laz");
+        assert!(!mnt.from_cache);
+        assert_eq!(mnt.lidar_crs, CrsId::Lambert93);
+
+        // Verify bare-ground MNT ignores both building (+10m) and Class 7 noise (-100m)!
+        let qx = 899_041.0;
+        let qy = 6_268_041.0;
+        let expected_g = 240.0 + 0.05 * (qx - 899_000.0);
+        let zg = mnt.sample_ground_z(qx, qy, CrsId::Lambert93).unwrap();
+        let zs = mnt.sample_surface_z(qx, qy, CrsId::Lambert93).unwrap();
+        assert!((zg - expected_g).abs() < 0.25, "zg={} expected={}", zg, expected_g);
+        assert!((zs - (expected_g + 5.0)).abs() < 0.25, "zs={} expected={}", zs, expected_g + 5.0);
+
+        // Second call must hit persistent disk cache instantly
+        let mnt_cached = load_ign_lidar_mnt(&test_dir, Some(&cache_path), bbox, CrsId::Lambert93)
+            .unwrap()
+            .expect("expected cached LidarTerrainModel");
+        assert!(mnt_cached.from_cache);
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }
