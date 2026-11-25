@@ -29,7 +29,7 @@ pub fn run_fltr_guided(
     }
 
     if s.median_filter_size >= 3 {
-        cur = median_filter(&cur, (s.median_filter_size / 2) as i32);
+        cur = median_filter(&cur, (s.median_filter_size / 2) as i32, s.threads);
     }
 
     if s.fill_holes {
@@ -47,97 +47,134 @@ pub fn run_fltr_guided(
 fn outlier_erode(disp: &DisparityMap, s: &StereoSettings) -> DisparityMap {
     let w = disp.width as i32;
     let h = disp.height as i32;
+    let wu = disp.width as usize;
+    let hu = disp.height as usize;
     let hkx = s.rm_half_kernel_x.max(1);
     let hky = s.rm_half_kernel_y.max(1);
     let min_frac = (s.rm_min_matches as f32 / 100.0).clamp(0.05, 0.95);
+    let rm_thresh = s.rm_threshold;
+    let max_md = s.max_mean_diff;
 
     let mut out = disp.clone();
-    for y in 0..h {
-        for x in 0..w {
-            let idx = (y * w + x) as usize;
-            if disp.valid[idx] == 0 {
-                continue;
-            }
-            let cx = disp.dx[idx];
-            let cy = disp.dy[idx];
-            let mut total = 0u32;
-            let mut matching = 0u32;
-            let mut mean_x = 0.0f32;
-            let mut valid_n = 0u32;
+    let n_threads = s.threads.clamp(1, hu.max(1));
+    let rows_per = (hu + n_threads - 1) / n_threads;
 
-            for ky in -hky..=hky {
-                let ny = y + ky;
-                if ny < 0 || ny >= h {
-                    continue;
-                }
-                for kx in -hkx..=hkx {
-                    let nx = x + kx;
-                    if nx < 0 || nx >= w || (kx == 0 && ky == 0) {
-                        continue;
-                    }
-                    total += 1;
-                    let nidx = (ny * w + nx) as usize;
-                    if disp.valid[nidx] != 0 {
-                        let ndx = disp.dx[nidx];
-                        let ndy = disp.dy[nidx];
-                        mean_x += ndx;
-                        valid_n += 1;
-                        if (ndx - cx).abs() <= s.rm_threshold && (ndy - cy).abs() <= s.rm_threshold {
-                            matching += 1;
+    std::thread::scope(|scope| {
+        for (t, vchunk) in out.valid.chunks_mut(rows_per * wu).enumerate() {
+            let y_start = t * rows_per;
+            scope.spawn(move || {
+                let rows = vchunk.len() / wu;
+                for ly in 0..rows {
+                    let y = (y_start + ly) as i32;
+                    let row_off = ly * wu;
+                    for x in 0..w {
+                        let idx = (y * w + x) as usize;
+                        if disp.valid[idx] == 0 {
+                            continue;
+                        }
+                        let cx = disp.dx[idx];
+                        let cy = disp.dy[idx];
+                        let mut total = 0u32;
+                        let mut matching = 0u32;
+                        let mut mean_x = 0.0f32;
+                        let mut valid_n = 0u32;
+
+                        for ky in -hky..=hky {
+                            let ny = y + ky;
+                            if ny < 0 || ny >= h {
+                                continue;
+                            }
+                            for kx in -hkx..=hkx {
+                                let nx = x + kx;
+                                if nx < 0 || nx >= w || (kx == 0 && ky == 0) {
+                                    continue;
+                                }
+                                total += 1;
+                                let nidx = (ny * w + nx) as usize;
+                                if disp.valid[nidx] != 0 {
+                                    let ndx = disp.dx[nidx];
+                                    let ndy = disp.dy[nidx];
+                                    mean_x += ndx;
+                                    valid_n += 1;
+                                    if (ndx - cx).abs() <= rm_thresh && (ndy - cy).abs() <= rm_thresh {
+                                        matching += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        let frac = if total > 0 { matching as f32 / total as f32 } else { 0.0 };
+                        let mean_diff = if valid_n > 0 {
+                            (cx - mean_x / valid_n as f32).abs()
+                        } else {
+                            f32::INFINITY
+                        };
+                        if frac < min_frac || mean_diff > max_md {
+                            vchunk[row_off + x as usize] = 0;
                         }
                     }
                 }
-            }
-
-            let frac = if total > 0 { matching as f32 / total as f32 } else { 0.0 };
-            let mean_diff = if valid_n > 0 {
-                (cx - mean_x / valid_n as f32).abs()
-            } else {
-                f32::INFINITY
-            };
-            if frac < min_frac || mean_diff > s.max_mean_diff {
-                out.valid[idx] = 0;
-            }
+            });
         }
-    }
+    });
     out
 }
 
-fn median_filter(disp: &DisparityMap, rad: i32) -> DisparityMap {
+fn median_filter(disp: &DisparityMap, rad: i32, threads: usize) -> DisparityMap {
     let w = disp.width as i32;
     let h = disp.height as i32;
+    let wu = disp.width as usize;
+    let hu = disp.height as usize;
     let mut out = disp.clone();
-    let mut vals_x = Vec::with_capacity(((2 * rad + 1) * (2 * rad + 1)) as usize);
-    let mut vals_y = Vec::with_capacity(((2 * rad + 1) * (2 * rad + 1)) as usize);
+    let n_threads = threads.clamp(1, hu.max(1));
+    let rows_per = (hu + n_threads - 1) / n_threads;
 
-    for y in 0..h {
-        for x in 0..w {
-            let idx = (y * w + x) as usize;
-            if disp.valid[idx] == 0 {
-                continue;
-            }
-            vals_x.clear();
-            vals_y.clear();
-            for ky in -rad..=rad {
-                let ny = (y + ky).clamp(0, h - 1);
-                for kx in -rad..=rad {
-                    let nx = (x + kx).clamp(0, w - 1);
-                    let nidx = (ny * w + nx) as usize;
-                    if disp.valid[nidx] != 0 {
-                        vals_x.push(disp.dx[nidx]);
-                        vals_y.push(disp.dy[nidx]);
+    std::thread::scope(|scope| {
+        for (t, (dxc, dyc)) in out
+            .dx
+            .chunks_mut(rows_per * wu)
+            .zip(out.dy.chunks_mut(rows_per * wu))
+            .enumerate()
+        {
+            let y_start = t * rows_per;
+            scope.spawn(move || {
+                let rows = dxc.len() / wu;
+                let cap = ((2 * rad + 1) * (2 * rad + 1)) as usize;
+                let mut vals_x = Vec::with_capacity(cap);
+                let mut vals_y = Vec::with_capacity(cap);
+                for ly in 0..rows {
+                    let y = (y_start + ly) as i32;
+                    let row_off = ly * wu;
+                    for x in 0..w {
+                        let idx = (y * w + x) as usize;
+                        if disp.valid[idx] == 0 {
+                            continue;
+                        }
+                        vals_x.clear();
+                        vals_y.clear();
+                        for ky in -rad..=rad {
+                            let ny = (y + ky).clamp(0, h - 1);
+                            for kx in -rad..=rad {
+                                let nx = (x + kx).clamp(0, w - 1);
+                                let nidx = (ny * w + nx) as usize;
+                                if disp.valid[nidx] != 0 {
+                                    vals_x.push(disp.dx[nidx]);
+                                    vals_y.push(disp.dy[nidx]);
+                                }
+                            }
+                        }
+                        if !vals_x.is_empty() {
+                            vals_x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                            vals_y.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                            let mid = vals_x.len() / 2;
+                            dxc[row_off + x as usize] = vals_x[mid];
+                            dyc[row_off + x as usize] = vals_y[mid];
+                        }
                     }
                 }
-            }
-            if !vals_x.is_empty() {
-                vals_x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                vals_y.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let mid = vals_x.len() / 2;
-                out.dx[idx] = vals_x[mid];
-                out.dy[idx] = vals_y[mid];
-            }
+            });
         }
-    }
+    });
     out
 }
 
@@ -313,9 +350,35 @@ fn remove_small_speckles(disp: &mut DisparityMap, max_speckle_size: usize, max_d
     }
 }
 
-/// Multi-threaded 5x5 Edge-Preserving Joint Bilateral Disparity Filter:
-/// - Smooths subpixel roughness on flat surfaces (roads, lawns, pools, flat roofs) by ~4x (to < 0.08 px / < 3 cm Z)
-/// - Hard disparity cliff gate (`|d_q - d_p| <= 1.1 px`) + radiometric guide weight (`sigma_I = 0.06`)
+/// Solve a 3x3 symmetric positive-definite linear system `A * [a, b, c]^T = rhs` in `f64`.
+#[inline]
+fn solve_sym_3x3_f64(
+    m00: f64, m01: f64, m02: f64,
+    m11: f64, m12: f64, m22: f64,
+    b0: f64, b1: f64, b2: f64,
+) -> Option<(f64, f64, f64)> {
+    let det = m00 * (m11 * m22 - m12 * m12)
+        - m01 * (m01 * m22 - m12 * m02)
+        + m02 * (m01 * m12 - m11 * m02);
+    if det.abs() < 1e-12 || !det.is_finite() {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let a = (b0 * (m11 * m22 - m12 * m12) - m01 * (b1 * m22 - m12 * b2) + m02 * (b1 * m12 - m11 * b2)) * inv;
+    let b = (m00 * (b1 * m22 - m12 * b2) - b0 * (m01 * m22 - m12 * m02) + m02 * (m01 * b2 - b1 * m02)) * inv;
+    let c = (m00 * (m11 * b2 - b1 * m12) - m01 * (m01 * b2 - b1 * m02) + b0 * (m01 * m12 - m11 * m02)) * inv;
+    if a.is_finite() && b.is_finite() && c.is_finite() {
+        Some((a, b, c))
+    } else {
+        None
+    }
+}
+
+/// Multi-threaded 9x9 Edge-Preserving Local Planar Filter (`d(dx, dy) = a*dx + b*dy + c` in `f64`):
+/// - Fits a weighted local plane over coplanar same-material neighbors (`9x9`, ~42 cm on Meyreuil)
+/// - Eliminates granulometry and residual undulations on flat roofs, asphalt, and lawns
+/// - Preserves sloped pitched roofs and roads with ZERO slope bias (unlike box/mean bilateral)
+/// - Hard disparity cliff gate (`|d_q - d_p| <= 1.25 px`) + radiometric guide weight (`sigma_I = 0.085`)
 ///   strictly prevents rounding or bleeding across building walls, curbs, and vehicles.
 fn joint_bilateral_filter(
     disp: &DisparityMap,
@@ -324,7 +387,7 @@ fn joint_bilateral_filter(
 ) -> DisparityMap {
     let w = disp.width as usize;
     let h = disp.height as usize;
-    if w < 5 || h < 5 {
+    if w < 9 || h < 9 {
         return disp.clone();
     }
 
@@ -340,14 +403,14 @@ fn joint_bilateral_filter(
                 .collect()
         });
 
-    let rad = 2i32;
-    let max_step = 1.2f32;
-    let inv_2sig_s2 = 1.0f32 / (2.0 * 2.0 * 2.0); // sigma_s = 2.0 px
-    let inv_2sig_d2 = 1.0f32 / (2.0 * 0.75 * 0.75); // sigma_d = 0.75 px (strongly damps +/-0.5 px granulometry)
-    let inv_2sig_i2 = 1.0f32 / (2.0 * 0.08 * 0.08); // sigma_I = 0.08
+    let rad = 4i32; // 9x9 local planar support
+    let max_step = 1.25f32;
+    let inv_2sig_s2 = 1.0f32 / (2.0 * 3.5 * 3.5); // sigma_s = 3.5 px
+    let inv_2sig_d2 = 1.0f32 / (2.0 * 0.80 * 0.80); // sigma_d = 0.80 px
+    let inv_2sig_i2 = 1.0f32 / (2.0 * 0.085 * 0.085); // sigma_I = 0.085
 
-    // Precompute 5x5 spatial Gaussian weights
-    let mut sp_w = [[0.0f32; 5]; 5];
+    // Precompute 9x9 spatial Gaussian weights
+    let mut sp_w = [[0.0f32; 9]; 9];
     for ky in -rad..=rad {
         for kx in -rad..=rad {
             let r2 = (kx * kx + ky * ky) as f32;
@@ -383,9 +446,19 @@ fn joint_bilateral_filter(
                             }
                             let cx = src.dx[idx];
                             let gi_c = g_ref.map(|g| g[idx]);
-                            let mut sum_x = 0.0f32;
-                            let mut sum_y = 0.0f32;
-                            let mut sum_w = 0.0f32;
+                            let mut m00 = 0.0f64;
+                            let mut m01 = 0.0f64;
+                            let mut m02 = 0.0f64;
+                            let mut m11 = 0.0f64;
+                            let mut m12 = 0.0f64;
+                            let mut m22 = 0.0f64;
+                            let mut b0 = 0.0f64;
+                            let mut b1 = 0.0f64;
+                            let mut b2 = 0.0f64;
+                            let mut sum_y = 0.0f64;
+                            let mut min_d = f32::INFINITY;
+                            let mut max_d = f32::NEG_INFINITY;
+                            let mut cnt = 0u32;
 
                             for ky in -rad..=rad {
                                 let ny = y + ky;
@@ -394,6 +467,7 @@ fn joint_bilateral_filter(
                                 }
                                 let nrow = (ny as usize) * w;
                                 let sp_row = &sp_w[(ky + rad) as usize];
+                                let ky_f = ky as f64;
                                 for kx in -rad..=rad {
                                     let nx = x + kx;
                                     if nx < 0 || nx >= w as i32 {
@@ -414,15 +488,40 @@ fn joint_bilateral_filter(
                                         let di = g[nidx] - gc;
                                         wt *= (-(di * di) * inv_2sig_i2).exp();
                                     }
-                                    sum_x += ndx * wt;
-                                    sum_y += src.dy[nidx] * wt;
-                                    sum_w += wt;
+                                    let wf = wt as f64;
+                                    let kx_f = kx as f64;
+                                    let d_f = ndx as f64;
+                                    m00 += wf * kx_f * kx_f;
+                                    m01 += wf * kx_f * ky_f;
+                                    m02 += wf * kx_f;
+                                    m11 += wf * ky_f * ky_f;
+                                    m12 += wf * ky_f;
+                                    m22 += wf;
+                                    b0 += wf * kx_f * d_f;
+                                    b1 += wf * ky_f * d_f;
+                                    b2 += wf * d_f;
+                                    sum_y += wf * src.dy[nidx] as f64;
+                                    if ndx < min_d { min_d = ndx; }
+                                    if ndx > max_d { max_d = ndx; }
+                                    cnt += 1;
                                 }
                             }
 
-                            if sum_w > 1e-6 {
-                                dxc[row_off + x as usize] = sum_x / sum_w;
-                                dyc[row_off + x as usize] = sum_y / sum_w;
+                            if m22 > 1e-6 {
+                                let est = if cnt >= 9 {
+                                    // Exact f64 local plane fit evaluated at center (0, 0) = c (zero slope bias!)
+                                    solve_sym_3x3_f64(
+                                        m00 + 1e-6, m01, m02,
+                                        m11 + 1e-6, m12, m22,
+                                        b0, b1, b2,
+                                    )
+                                    .map(|(_, _, c)| (c as f32).clamp(min_d, max_d))
+                                    .unwrap_or((b2 / m22) as f32)
+                                } else {
+                                    (b2 / m22) as f32
+                                };
+                                dxc[row_off + x as usize] = est;
+                                dyc[row_off + x as usize] = (sum_y / m22) as f32;
                             }
                         }
                     }
@@ -487,13 +586,13 @@ mod tests {
         let h = 40u32;
         let mut disp = DisparityMap::new(w, h);
         let mut guide = ImageF32::new(w, h);
-        // Left half: flat ground at dx = 0.0 with +/-0.35 px checkerboard granulometry
-        // Right half: tall building roof at dx = -30.0 (10 m cliff!)
+        // Left half: tilted roof pitch dx(x) = -0.15 * x with +/-0.35 px granulometry
+        // Right half: tall vertical cliff down to -30.0 (10 m step!)
         for y in 0..h {
             for x in 0..w {
                 if x < 20 {
                     let noise = if (x + y) % 2 == 0 { 0.35 } else { -0.35 };
-                    disp.set(x, y, noise, 0.0, true);
+                    disp.set(x, y, -0.15 * x as f32 + noise, 0.0, true);
                     guide.set(x, y, 0.3);
                 } else {
                     disp.set(x, y, -30.0, 0.0, true);
@@ -503,14 +602,15 @@ mod tests {
         }
 
         let smooth = joint_bilateral_filter(&disp, Some(&guide), 2);
-        // Flat ground noise must collapse from 0.35 px down to < 0.06 px!
-        let mut max_flat_err = 0.0f32;
+        // Sloped plane noise must collapse from 0.35 px down to < 0.05 px WITH ZERO SLOPE BIAS even near edge x=19!
+        let mut max_slope_err = 0.0f32;
         for y in 4..36 {
-            for x in 4..16 {
-                max_flat_err = max_flat_err.max(smooth.dx[smooth.idx(x, y)].abs());
+            for x in 4..20 {
+                let expected = -0.15 * x as f32;
+                max_slope_err = max_slope_err.max((smooth.dx[smooth.idx(x, y)] - expected).abs());
             }
         }
-        assert!(max_flat_err < 0.06, "Flat plane noise not smoothed: {}", max_flat_err);
+        assert!(max_slope_err < 0.05, "Sloped plane noise/bias too high: {}", max_slope_err);
 
         // Building roof edge right at x = 20 MUST remain razor-sharp at -30.0 (zero bleeding!)
         for y in 4..36 {

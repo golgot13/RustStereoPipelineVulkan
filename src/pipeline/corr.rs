@@ -224,12 +224,10 @@ pub fn patch_cost(
             let var_l = (sum_ll * inv_n - mean_l * mean_l).max(0.0);
             let var_r = (sum_rr * inv_n - mean_r * mean_r).max(0.0);
             let cov = sum_lr * inv_n - mean_l * mean_r;
-            let denom = (var_l * var_r).sqrt();
-            if denom < 1e-6 {
-                1.0
-            } else {
-                1.0 - (cov / denom).clamp(-1.0, 1.0)
-            }
+            // Physical noise-floor variance damping (sigma_n = 0.025) prevents noise amplification on flat roofs/asphalt
+            let var_floor = 0.000625f32;
+            let denom = ((var_l + var_floor) * (var_r + var_floor)).sqrt();
+            1.0 - (cov / denom).clamp(-1.0, 1.0)
         }
     }
 }
@@ -452,7 +450,7 @@ fn correlate_sgm(
                     }
                     for x in 1..w {
                         let grad = (gdata[row_pix + x] - gdata[row_pix + x - 1]).abs();
-                        let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
+                        let (p1_eff, p2_eff) = adaptive_sgm_penalties(p1, p2_base, grad);
                         let c_off = row_cv + x * num_d;
                         let a_off = row_agg + x * num_d;
                         min_prev = crate::pipeline::simd::sgm_dp_step_add(
@@ -461,7 +459,7 @@ fn correlate_sgm(
                             &mut cur_l,
                             &mut agg_chunk[a_off..a_off + num_d],
                             min_prev,
-                            p1,
+                            p1_eff,
                             p2_eff,
                         );
                         std::mem::swap(&mut prev_l, &mut cur_l);
@@ -478,7 +476,7 @@ fn correlate_sgm(
                     }
                     for x in (0..w - 1).rev() {
                         let grad = (gdata[row_pix + x] - gdata[row_pix + x + 1]).abs();
-                        let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
+                        let (p1_eff, p2_eff) = adaptive_sgm_penalties(p1, p2_base, grad);
                         let c_off = row_cv + x * num_d;
                         let a_off = row_agg + x * num_d;
                         min_prev = crate::pipeline::simd::sgm_dp_step_add(
@@ -487,7 +485,7 @@ fn correlate_sgm(
                             &mut cur_l,
                             &mut agg_chunk[a_off..a_off + num_d],
                             min_prev,
-                            p1,
+                            p1_eff,
                             p2_eff,
                         );
                         std::mem::swap(&mut prev_l, &mut cur_l);
@@ -546,7 +544,7 @@ fn correlate_sgm(
                         let p_off = px_u * num_d;
                         let min_prev = prev_mins[px_u];
                         let grad = (guide.data[row_pix + x] - guide.data[py as usize * w + px_u]).abs();
-                        let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
+                        let (p1_eff, p2_eff) = adaptive_sgm_penalties(p1, p2_base, grad);
                         let mp2 = min_prev + p2_eff;
 
                         let qx = x as i32 - x_step;
@@ -564,14 +562,14 @@ fn correlate_sgm(
 
                         for d in 0..num_d {
                             let c0 = prev_row[p_off + d];
-                            let cm = if d > 0 { prev_row[p_off + d - 1] + p1 } else { f32::INFINITY };
-                            let cp = if d + 1 < num_d { prev_row[p_off + d + 1] + p1 } else { f32::INFINITY };
+                            let cm = if d > 0 { prev_row[p_off + d - 1] + p1_eff } else { f32::INFINITY };
+                            let cp = if d + 1 < num_d { prev_row[p_off + d + 1] + p1_eff } else { f32::INFINITY };
                             let best_p = c0.min(cm).min(cp).min(mp2) - min_prev;
 
                             let smooth = if q_valid {
                                 let q0 = cur_row[q_off + d];
-                                let qm = if d > 0 { cur_row[q_off + d - 1] + p1 } else { f32::INFINITY };
-                                let qp = if d + 1 < num_d { cur_row[q_off + d + 1] + p1 } else { f32::INFINITY };
+                                let qm = if d > 0 { cur_row[q_off + d - 1] + p1_eff } else { f32::INFINITY };
+                                let qp = if d + 1 < num_d { cur_row[q_off + d + 1] + p1_eff } else { f32::INFINITY };
                                 let best_q = q0.min(qm).min(qp).min(mq2) - min_q;
                                 0.5 * (best_p + best_q)
                             } else {
@@ -721,6 +719,21 @@ struct SyncMutF32Ptr(*mut f32);
 unsafe impl Send for SyncMutF32Ptr {}
 unsafe impl Sync for SyncMutF32Ptr {}
 
+/// Texture-adaptive SGM regularization: reinforces P1/P2 on radiometrically flat surfaces
+/// (`grad < 0.015`: white roofs, smooth asphalt, lawns) to suppress wavy blobs, while releasing
+/// P2 sharply across real image edges (`grad > 0.04`).
+#[inline(always)]
+fn adaptive_sgm_penalties(p1_base: f32, p2_base: f32, grad: f32) -> (f32, f32) {
+    let flat_boost = if grad < 0.015 {
+        1.0 + 0.85 * (1.0 - grad / 0.015)
+    } else {
+        1.0
+    };
+    let p1_eff = p1_base * flat_boost;
+    let p2_eff = (p2_base * flat_boost / (1.0 + 12.0 * grad)).max(p1_eff * 1.5);
+    (p1_eff, p2_eff)
+}
+
 /// Multi-threaded AVX2 fused 3-direction SGM sweep:
 /// - `downward == true`:  fuses `(0, +1)`, `(+1, +1)`, `(-1, +1)` in ONE top-to-bottom scan
 /// - `downward == false`: fuses `(0, -1)`, `(+1, -1)`, `(-1, -1)` in ONE bottom-to-top scan
@@ -813,14 +826,14 @@ fn run_sgm_fused_vd_sweep(
 
                             // Direction 0: Vertical (0, ±1) from (x, py)
                             let grad_v = (gx - guide[prev_row_pix + x]).abs();
-                            let p2_v = (p2_base / (1.0 + 10.0 * grad_v)).max(p1 * 1.5);
+                            let (p1_v, p2_v) = adaptive_sgm_penalties(p1, p2_base, grad_v);
                             let mv = crate::pipeline::simd::sgm_dp_step_add(
                                 cv_s,
                                 &prev_buf[x * stride..(x + 1) * stride],
                                 cur_v,
                                 agg_s,
                                 prev_min[x],
-                                p1,
+                                p1_v,
                                 p2_v,
                             );
 
@@ -828,14 +841,14 @@ fn run_sgm_fused_vd_sweep(
                             let mdl = if x > 0 {
                                 let px = x - 1;
                                 let grad_dl = (gx - guide[prev_row_pix + px]).abs();
-                                let p2_dl = (p2_base / (1.0 + 10.0 * grad_dl)).max(p1 * 1.5);
+                                let (p1_dl, p2_dl) = adaptive_sgm_penalties(p1, p2_base, grad_dl);
                                 crate::pipeline::simd::sgm_dp_step_add(
                                     cv_s,
                                     &prev_buf[dir_stride + px * stride..dir_stride + (px + 1) * stride],
                                     cur_dl,
                                     agg_s,
                                     prev_min[w + px],
-                                    p1,
+                                    p1_dl,
                                     p2_dl,
                                 )
                             } else {
@@ -853,14 +866,14 @@ fn run_sgm_fused_vd_sweep(
                             let mdr = if x + 1 < w {
                                 let px = x + 1;
                                 let grad_dr = (gx - guide[prev_row_pix + px]).abs();
-                                let p2_dr = (p2_base / (1.0 + 10.0 * grad_dr)).max(p1 * 1.5);
+                                let (p1_dr, p2_dr) = adaptive_sgm_penalties(p1, p2_base, grad_dr);
                                 crate::pipeline::simd::sgm_dp_step_add(
                                     cv_s,
                                     &prev_buf[2 * dir_stride + px * stride..2 * dir_stride + (px + 1) * stride],
                                     cur_dr,
                                     agg_s,
                                     prev_min[2 * w + px],
-                                    p1,
+                                    p1_dr,
                                     p2_dr,
                                 )
                             } else {
@@ -903,6 +916,29 @@ fn build_cost_volume_cpu(
     let h = left.height as usize;
     let census_l = compute_census_5x5(left);
     let census_r = compute_census_5x5(right);
+    // Precompute local 3x3 variance on left image for texture-gated Census matching GPU shader
+    let mut left_var = vec![0.0f32; w * h];
+    for y in 0..h {
+        let y0 = y.saturating_sub(1);
+        let y1 = (y + 1).min(h - 1);
+        for x in 0..w {
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(w - 1);
+            let mut s1 = 0.0f32;
+            let mut s2 = 0.0f32;
+            let mut cnt = 0.0f32;
+            for ny in y0..=y1 {
+                for nx in x0..=x1 {
+                    let v = left.data[ny * w + nx];
+                    s1 += v;
+                    s2 += v * v;
+                    cnt += 1.0;
+                }
+            }
+            let m = s1 / cnt;
+            left_var[y * w + x] = (s2 / cnt - m * m).max(0.0);
+        }
+    }
 
     let mut cost_vol = vec![1.0f32; w * h * num_d];
     std::thread::scope(|scope| {
@@ -910,12 +946,15 @@ fn build_cost_volume_cpu(
             let y_start = t * rows_per;
             let cl = &census_l;
             let cr = &census_r;
+            let lv_ref = &left_var;
             scope.spawn(move || {
                 let rows = chunk.len() / (w * num_d);
                 for ly in 0..rows {
                     let y = (y_start + ly) as i32;
                     for x in 0..w as i32 {
                         let base = (ly * w + x as usize) * num_d;
+                        let lv = lv_ref[(y as usize) * w + (x as usize)];
+                        let tex_conf = lv / (lv + 0.000625);
                         for di in 0..num_d {
                             let d = min_d + di as i32;
                             if x + d < 0 || x + d >= w as i32 {
@@ -929,7 +968,8 @@ fn build_cost_volume_cpu(
                                 CostMode::Ncc => {
                                     let pc = patch_cost(left, right, x, y, d, 0, hkw, hkh, s.cost_mode);
                                     let cc = census_patch_cost(cl, cr, w as i32, h as i32, x, y, d, 0, 1, 1);
-                                    0.65 * pc + 0.35 * cc
+                                    let cc_gated = 0.5 + tex_conf * (cc - 0.5);
+                                    0.65 * pc + 0.35 * cc_gated
                                 }
                                 _ => patch_cost(left, right, x, y, d, 0, hkw, hkh, s.cost_mode),
                             };
@@ -1076,12 +1116,12 @@ mod tests {
                             if prev[po + d] < mn { mn = prev[po + d]; }
                         }
                         let grad = (guide[y * w + x] - guide[py as usize * w + px_u]).abs();
-                        let p2_eff = (p2_base / (1.0 + 10.0 * grad)).max(p1 * 1.5);
+                        let (p1_eff, p2_eff) = adaptive_sgm_penalties(p1, p2_base, grad);
                         let mp2 = mn + p2_eff;
                         for d in 0..num_d {
                             let c0 = prev[po + d];
-                            let cm = if d > 0 { prev[po + d - 1] + p1 } else { f32::INFINITY };
-                            let cp = if d + 1 < num_d { prev[po + d + 1] + p1 } else { f32::INFINITY };
+                            let cm = if d > 0 { prev[po + d - 1] + p1_eff } else { f32::INFINITY };
+                            let cp = if d + 1 < num_d { prev[po + d + 1] + p1_eff } else { f32::INFINITY };
                             let v = cv[idx + d] + (c0.min(cm).min(cp).min(mp2) - mn);
                             cur[x * num_d + d] = v;
                             agg_ref[idx + d] += v;

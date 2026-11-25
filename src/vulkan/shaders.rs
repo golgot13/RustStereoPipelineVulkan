@@ -595,11 +595,13 @@ pub fn build_cost_volume_3d_shader() -> Vec<u32> {
     let c5 = b.const_i32(5);
     let c6 = b.const_i32(6);
     let f0 = b.const_f32(0.0);
+    let f_half = b.const_f32(0.5);
     let f1 = b.const_f32(1.0);
     let f2 = b.const_f32(2.0);
     let f_w_ncc = b.const_f32(0.65);
     let f_w_cen = b.const_f32(0.35);
-    let f_eps = b.const_f32(1.0e-6);
+    // Physical camera noise-floor variance sigma_n^2 = 0.025^2 = 0.000625 (~6/255 gray levels)
+    let f_var_noise = b.const_f32(0.000625);
 
     b.begin_main();
     let var_di = b.fn_var_i32();
@@ -805,16 +807,27 @@ pub fn build_cost_volume_3d_shader() -> Vec<u32> {
     let vr_raw = b.binop(OP_FSUB, b.ty_f32, srr, sr_mr);
     let vl = b.glsl2(GLSL_FMAX, b.ty_f32, vl_raw, f0);
     let vr = b.glsl2(GLSL_FMAX, b.ty_f32, vr_raw, f0);
-    let vl_vr = b.binop(OP_FMUL, b.ty_f32, vl, vr);
-    let denom_sq = b.binop(OP_FADD, b.ty_f32, vl_vr, f_eps);
-    let denom = b.glsl1(GLSL_SQRT, b.ty_f32, denom_sq);
+    // Variance noise-floor damping prevents amplifying 1-2 gray-level camera noise on uniform roofs/asphalt
+    let v_floor = b.binop(OP_FMUL, b.ty_f32, cnt_f, f_var_noise);
+    let vl_reg = b.binop(OP_FADD, b.ty_f32, vl, v_floor);
+    let vr_reg = b.binop(OP_FADD, b.ty_f32, vr, v_floor);
+    let vl_vr = b.binop(OP_FMUL, b.ty_f32, vl_reg, vr_reg);
+    let denom = b.glsl1(GLSL_SQRT, b.ty_f32, vl_vr);
     let ncc = b.binop(OP_FDIV, b.ty_f32, cov, denom);
     let ncc_cost_raw = b.binop(OP_FSUB, b.ty_f32, f1, ncc);
     let ncc_clamped_lo = b.glsl2(GLSL_FMAX, b.ty_f32, ncc_cost_raw, f0);
     let ncc_cost = b.glsl2(GLSL_FMIN, b.ty_f32, ncc_clamped_lo, f2);
-    // Hybrid ZNCC + Census cost suppresses dark/shadow & periodic parking-lot mismatches
+    // Texture-gated Census: collapses to neutral 0.5 on flat sensor noise, stays 100% active on real edges
+    let v_sum = b.binop(OP_FADD, b.ty_f32, vl, vr);
+    let v_floor2 = b.binop(OP_FMUL, b.ty_f32, f2, v_floor);
+    let tex_den = b.binop(OP_FADD, b.ty_f32, v_sum, v_floor2);
+    let tex_conf = b.binop(OP_FDIV, b.ty_f32, v_sum, tex_den);
+    let cen_diff = b.binop(OP_FSUB, b.ty_f32, cen_norm, f_half);
+    let cen_scaled = b.binop(OP_FMUL, b.ty_f32, tex_conf, cen_diff);
+    let cen_gated = b.binop(OP_FADD, b.ty_f32, f_half, cen_scaled);
+    // Hybrid ZNCC + texture-gated Census cost suppresses both flat-roof ripples and shadow/parking mismatches
     let ncc_w = b.binop(OP_FMUL, b.ty_f32, ncc_cost, f_w_ncc);
-    let cen_w = b.binop(OP_FMUL, b.ty_f32, cen_norm, f_w_cen);
+    let cen_w = b.binop(OP_FMUL, b.ty_f32, cen_gated, f_w_cen);
     let hybrid_ncc = b.binop(OP_FADD, b.ty_f32, ncc_w, cen_w);
     let is_ncc = b.binop(OP_IEQUAL, b.ty_bool, cost_mode, c2);
     let is_cen = b.binop(OP_IEQUAL, b.ty_bool, cost_mode, c3);
