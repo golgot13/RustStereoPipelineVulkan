@@ -145,6 +145,26 @@ impl CrsId {
             Self::Mars,
         ]
     }
+
+    /// Auto-detect official French metropolitan RGF93 projection (`EPSG:2154` Lambert-93
+    /// or `EPSG:3942..=3950` CC42..CC50) directly from projected `(X, Y)` coordinates.
+    pub fn guess_french_from_xy(x: f64, y: f64) -> Option<Self> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        // RGF93 / Lambert-93 (EPSG:2154): X0 = 700,000, Y0 = 6,600,000
+        if (90_000.0..=1_300_000.0).contains(&x) && (6_000_000.0..=7_200_000.0).contains(&y) {
+            return Some(Self::Lambert93);
+        }
+        // RGF93 / CC42..CC50 (EPSG:3942..=3950): X0 = 1,700,000, Y0 = (zone - 41) * 1e6 + 200,000
+        if (1_000_000.0..=2_400_000.0).contains(&x) && (1_000_000.0..=9_500_000.0).contains(&y) {
+            let y_million = (y / 1_000_000.0).floor() as i32;
+            if (1..=9).contains(&y_million) {
+                return Some(Self::CcZone((41 + y_million) as u8));
+            }
+        }
+        None
+    }
 }
 
 /// Exact GRS80/IGN Lambert Conformal Conic 2SP engine (Lambert-93 EPSG:2154 & CC42..CC50 EPSG:3942..3950).

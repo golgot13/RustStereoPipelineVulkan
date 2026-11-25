@@ -128,6 +128,8 @@ SCRIPTING & ROBUSTNESS OPTIONS:
   --gcp-picks <file.json>        Explicit path to user-validated subpixel GCP picks JSON (auto-discovered if omitted)
   --footprints <file.json>       Explicit path to validated ground footprints JSON (auto-discovered if omitted)
   --no-gcp-refine                Disable two-stage f64 LM GCP-pick pose refinement (keep raw GNSS/IMU poses)
+  --ign-data <dir>               Explicit path to IGN LiDAR HD .laz directory (auto-discovers IGN_DATA/ if omitted)
+  --no-ign-lidar                 Disable local IGN LiDAR HD MNT/MNS terrain model loading
   --full-model                   Process ALL 1:1 tiles covering the complete overlap of each stereo model
   --express                      Express benchmark mode: ZERO intermediate outputs (only dense RGB f64 PLY + exact timings)
   --merge-cloud                  Produce unified RGB f64 chantier_merged-PC.ply (auto-ON for --all-pairs)
@@ -196,6 +198,8 @@ struct ParsedArgs {
     gcp_picks_path: Option<String>,
     footprints_path: Option<String>,
     no_gcp_refine: bool,
+    ign_data_path: Option<String>,
+    no_ign_lidar: bool,
 }
 
 fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
@@ -240,6 +244,8 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
     let mut gcp_picks_path = None;
     let mut footprints_path = None;
     let mut no_gcp_refine = false;
+    let mut ign_data_path = None;
+    let mut no_ign_lidar = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -345,6 +351,8 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
             "--gcp-picks" => gcp_picks_path = Some(next(&mut i, a)?.to_string()),
             "--footprints" => footprints_path = Some(next(&mut i, a)?.to_string()),
             "--no-gcp-refine" => no_gcp_refine = true,
+            "--ign-data" => ign_data_path = Some(next(&mut i, a)?.to_string()),
+            "--no-ign-lidar" => no_ign_lidar = true,
             "--full-model" => full_model = true,
             "--express" => {
                 express = true;
@@ -421,6 +429,8 @@ fn parse_common_args(args: &[String]) -> Result<ParsedArgs> {
         gcp_picks_path,
         footprints_path,
         no_gcp_refine,
+        ign_data_path,
+        no_ign_lidar,
     })
 }
 
@@ -523,6 +533,8 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
         p.gcp_picks_path.as_deref().map(Path::new),
         p.footprints_path.as_deref().map(Path::new),
         !p.no_gcp_refine,
+        p.ign_data_path.as_deref().map(Path::new),
+        !p.no_ign_lidar,
     )?;
     if !p.ndjson {
         println!("=== Chantier Aérien Découvert ===");
@@ -535,15 +547,49 @@ fn cmd_chantier(args: &[String]) -> Result<()> {
             chantier.calibration.focal_mm,
             chantier.calibration.pixel_size_mm
         );
-        println!("  Trajectoire  : {} ({} poses)", chantier.trajectory_file.display(), chantier.poses.len());
+        println!(
+            "  Trajectoire  : {} ({} poses, CRS={})",
+            chantier.trajectory_file.display(),
+            chantier.poses.len(),
+            chantier.survey_crs.code()
+        );
         println!("  GCP Terrain  : {} points", chantier.gcps.len());
+        if let Some(ref mnt) = chantier.lidar_mnt {
+            let mut dz_gcp: Vec<f64> = chantier
+                .gcps
+                .iter()
+                .filter_map(|g| mnt.sample_ground_z(g.x, g.y, chantier.survey_crs).map(|zm| zm - g.z))
+                .collect();
+            let gcp_cmp = if !dz_gcp.is_empty() {
+                dz_gcp.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let med = dz_gcp[dz_gcp.len() / 2];
+                format!(" | MNT vs {} GCP dZ_med={:+.3} m", dz_gcp.len(), med)
+            } else {
+                String::new()
+            };
+            println!(
+                "  LiDAR HD MNT : {} ({} dalles .laz, {} -> {}, grille {}x{} @{:.1} m, Z=[{:.1}..{:.1}] m, {}{})",
+                mnt.source_dir.display(),
+                mnt.tile_count,
+                mnt.lidar_crs.code(),
+                chantier.survey_crs.code(),
+                mnt.width,
+                mnt.height,
+                mnt.cell_size,
+                mnt.z_min,
+                mnt.z_max,
+                if mnt.from_cache { "cache disque" } else { "construit & mis en cache" },
+                gcp_cmp
+            );
+        }
         if let Some(ref fp_path) = chantier.footprints_file {
             if let Some(ref fr) = chantier.footprint_report {
                 println!(
-                    "  Empreintes   : {} ({}/{} poses | IoU moy={:.1}% min={:.1}% | dXY={:.2} m | orient. OK={}/{})",
+                    "  Empreintes   : {} ({}/{} poses | {} | IoU moy={:.1}% min={:.1}% | dXY={:.2} m | orient. OK={}/{})",
                     fp_path.display(),
                     fr.matched_poses,
                     fr.total_poses,
+                    if fr.used_lidar_mnt { "AGL LiDAR MNT" } else { "plan Z_ref" },
                     fr.mean_iou_pct,
                     fr.min_iou_pct,
                     fr.mean_center_err_m,
@@ -1020,6 +1066,8 @@ fn run_chantier_full_model(
                     band_l.as_ref(),
                     band_r.as_ref(),
                     prev_median_dx,
+                    chantier.lidar_mnt.as_ref(),
+                    chantier.survey_crs,
                 )?;
                 let r_ms = t_rect.elapsed().as_secs_f64() * 1000.0;
                 rect_ms += r_ms;

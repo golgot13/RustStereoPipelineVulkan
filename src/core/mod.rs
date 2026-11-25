@@ -9,3 +9,4 @@ pub mod error;
 pub mod hardware;
 pub mod job;
 pub mod json;
+pub mod lidar_mnt;

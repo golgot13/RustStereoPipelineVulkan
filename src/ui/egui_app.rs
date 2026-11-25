@@ -411,14 +411,25 @@ impl StereoEguiApp {
     }
 
     fn load_chantier_pair(&mut self, ctx: &egui::Context) {
-        let dir = Path::new(self.chantier_dir.trim());
-        let chantier = match crate::core::chantier::Chantier::discover(dir) {
+        let dir = std::path::PathBuf::from(self.chantier_dir.trim());
+        let chantier = match crate::core::chantier::Chantier::discover(&dir) {
             Ok(c) => c,
             Err(e) => {
                 self.log(format!("Chantier error: {}", e));
                 return;
             }
         };
+        if let Some(ref mnt) = chantier.lidar_mnt {
+            self.log(format!(
+                "LiDAR HD MNT: {} tiles ({} -> {}, Z=[{:.1}..{:.1}] m, {})",
+                mnt.tile_count,
+                mnt.lidar_crs.code(),
+                chantier.survey_crs.code(),
+                mnt.z_min,
+                mnt.z_max,
+                if mnt.from_cache { "cache" } else { "built" }
+            ));
+        }
         if chantier.pairs.is_empty() {
             self.log("No stereo pairs detected in chantier".to_string());
             return;
@@ -728,6 +739,8 @@ impl StereoEguiApp {
                         band_l.as_ref(),
                         band_r.as_ref(),
                         prev_dx,
+                        chantier.lidar_mnt.as_ref(),
+                        chantier.survey_crs,
                     ) {
                         Ok(Some(p)) => p,
                         Ok(None) => {

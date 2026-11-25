@@ -16,8 +16,10 @@ use crate::core::chantier::{
     build_epipolar_rectified_cameras, build_pinhole_for_pose, CameraCalibration, Chantier,
     GroundControlPoint, ImagePose, StereoPairEntry,
 };
+use crate::core::crs::CrsId;
 use crate::core::error::{PipelineError, Result};
 use crate::core::json::parse_json;
+use crate::core::lidar_mnt::LidarTerrainModel;
 use crate::math::{triangulate_rays, Vec2, Vec3};
 
 /// One user-validated subpixel GCP image observation `[gcp_id, image_id, col_px, row_px]`.
@@ -49,6 +51,7 @@ pub struct FootprintValidationReport {
     pub min_iou_pct: f64,
     pub orientation_ok: usize,
     pub orientation_failed_ids: Vec<String>,
+    pub used_lidar_mnt: bool,
 }
 
 /// Before/After metrics of the two-stage `f64` LM GCP-pick block refinement.
@@ -301,11 +304,15 @@ fn local_ground_z_at(gcps: &[GroundControlPoint], x: f64, y: f64, fallback_z: f6
 }
 
 /// Cross-validate all discovered camera poses against `aerophotogram_footprints_validation.json`.
+/// When `lidar_mnt` is available, projects all 4 sensor corners via exact iterative `f64` ray-MNT
+/// intersection (real local AGL terrain elevation) instead of a flat reference plane.
 pub fn validate_chantier_footprints(
     cal: &CameraCalibration,
     poses: &[ImagePose],
     gcps: &[GroundControlPoint],
     footprints: &HashMap<String, ValidatedFootprint>,
+    lidar_mnt: Option<&LidarTerrainModel>,
+    survey_crs: CrsId,
 ) -> FootprintValidationReport {
     let w = cal.width_px.max(1);
     let h = cal.height_px.max(1);
@@ -320,6 +327,7 @@ pub fn validate_chantier_footprints(
     let mut min_iou = 1.0f64;
     let mut orient_ok = 0usize;
     let mut orient_failed = Vec::new();
+    let mut used_lidar_mnt = false;
 
     for pose in poses {
         let key = normalize_id(&pose.id);
@@ -331,7 +339,9 @@ pub fn validate_chantier_footprints(
         } else {
             pose.z - 1000.0
         };
-        let gz = local_ground_z_at(gcps, pose.x, pose.y, fallback_z);
+        let gz = lidar_mnt
+            .and_then(|m| m.sample_ground_z(pose.x, pose.y, survey_crs))
+            .unwrap_or_else(|| local_ground_z_at(gcps, pose.x, pose.y, fallback_z));
         let cam = build_pinhole_for_pose(cal, pose, w, h, 0, 0);
 
         let mut proj_corners = [[0.0f64; 2]; 4];
@@ -342,13 +352,25 @@ pub fn validate_chantier_footprints(
                 valid = false;
                 break;
             }
-            let t = (gz - cam.center.z) / ray.z;
-            if t <= 0.0 || !t.is_finite() {
-                valid = false;
-                break;
+            let hit = if let Some(mnt) = lidar_mnt {
+                if let Some(p) = mnt.intersect_ray_ground(cam.center, ray, gz, survey_crs) {
+                    used_lidar_mnt = true;
+                    Some(p)
+                } else {
+                    let t = (gz - cam.center.z) / ray.z;
+                    if t > 0.0 && t.is_finite() { Some(cam.center + ray * t) } else { None }
+                }
+            } else {
+                let t = (gz - cam.center.z) / ray.z;
+                if t > 0.0 && t.is_finite() { Some(cam.center + ray * t) } else { None }
+            };
+            match hit {
+                Some(p) => proj_corners[ci] = [p.x, p.y],
+                None => {
+                    valid = false;
+                    break;
+                }
             }
-            let p = cam.center + ray * t;
-            proj_corners[ci] = [p.x, p.y];
         }
         if !valid {
             orient_failed.push(pose.id.clone());
@@ -394,17 +416,20 @@ pub fn validate_chantier_footprints(
         min_iou_pct: if matched > 0 { 100.0 * min_iou } else { 0.0 },
         orientation_ok: orient_ok,
         orientation_failed_ids: orient_failed,
+        used_lidar_mnt,
     }
 }
 
 /// Compute validated ground overlap area (m^2) and projected rectified bounds `(u_min, u_max, v_min, v_max)`
-/// from two validated ground footprints when available.
+/// from two validated ground footprints when available (using local LiDAR MNT elevation if loaded).
 pub fn validated_pair_overlap_bounds(
     footprints: &HashMap<String, ValidatedFootprint>,
     left_id: &str,
     right_id: &str,
     ground_z: f64,
     rect_cam_l: &PinholeCamera,
+    lidar_mnt: Option<&LidarTerrainModel>,
+    survey_crs: CrsId,
 ) -> Option<(f64, f64, f64, f64, f64)> {
     let fp_l = footprints.get(&normalize_id(left_id))?;
     let fp_r = footprints.get(&normalize_id(right_id))?;
@@ -420,10 +445,13 @@ pub fn validated_pair_overlap_bounds(
     let mut max_u = f64::NEG_INFINITY;
     let mut min_v = f64::INFINITY;
     let mut max_v = f64::NEG_INFINITY;
-    // Sample intersection polygon across +/- 40 m vertical margin so terrain relief is never clipped
-    for &dz in &[-40.0, 0.0, 40.0] {
-        for &[gx, gy] in &inter {
-            let rp = rect_cam_l.point_to_pixel(Vec3::new(gx, gy, ground_z + dz));
+    // Sample intersection polygon across local terrain/canopy vertical margin so relief is never clipped
+    for &[gx, gy] in &inter {
+        let zv = lidar_mnt
+            .and_then(|m| m.sample_ground_z(gx, gy, survey_crs))
+            .unwrap_or(ground_z);
+        for &dz in &[-25.0, 0.0, 40.0] {
+            let rp = rect_cam_l.point_to_pixel(Vec3::new(gx, gy, zv + dz));
             if rp.x.is_finite() && rp.y.is_finite() {
                 if rp.x < min_u { min_u = rp.x; }
                 if rp.x > max_u { max_u = rp.x; }
@@ -1187,6 +1215,8 @@ mod tests {
             gcp_file: None,
             gcp_picks_file: None,
             footprints_file: None,
+            survey_crs: CrsId::CcZone(44),
+            lidar_mnt: None,
             calibration: raw_cal,
             poses: raw_poses,
             gcps,
@@ -1204,5 +1234,83 @@ mod tests {
         assert!(rep.final_epi_dy_rmse_px < 0.15, "final epipolar dy too high: {}", rep.final_epi_dy_rmse_px);
         assert!(rep.final_tri_dz_bias_m.abs() < 0.02, "final dZ bias too high: {}", rep.final_tri_dz_bias_m);
         assert!(rep.final_tri_xyz_rmse_m < 0.02, "final 3D XYZ RMSE too high: {}", rep.final_tri_xyz_rmse_m);
+    }
+
+    #[test]
+    fn test_footprint_validation_with_sloped_lidar_mnt_cross_crs() {
+        use crate::core::crs::transform_point;
+
+        // Build a sloped Lambert-93 LiDAR MNT covering Meyreuil (~150 m relief across footprint)
+        let w = 250usize;
+        let h = 250usize;
+        let cs = 20.0;
+        let min_x = 895_000.0;
+        let min_y = 6_264_000.0;
+        let mut zg = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let px = min_x + x as f64 * cs;
+                let py = min_y + y as f64 * cs;
+                zg[y * w + x] = (180.0 + 0.06 * (px - min_x) + 0.04 * (py - min_y)) as f32;
+            }
+        }
+        let mnt = LidarTerrainModel {
+            source_dir: PathBuf::from("IGN_DATA"),
+            tile_count: 4,
+            lidar_crs: CrsId::Lambert93,
+            min_x,
+            min_y,
+            cell_size: cs,
+            width: w,
+            height: h,
+            z_ground: zg.clone(),
+            z_surface: zg,
+            z_min: 180.0,
+            z_max: 680.0,
+            from_cache: false,
+        };
+
+        // Place DMC-IV pose in CC44 (EPSG:3944) directly over center of the Lambert-93 MNT
+        let center_cc44 = transform_point(CrsId::Lambert93, CrsId::CcZone(44), Vec3::new(897_500.0, 6_266_500.0, 0.0)).unwrap();
+        let cal = CameraCalibration::parse_str(
+            "CAMERA;DMCIV;143.0016;0.0;0.0;1742.0;0;0.02;31520;13760;0.003760;0\n",
+        )
+        .unwrap();
+        let pose = ImagePose {
+            id: "025_0727".into(),
+            x: center_cc44.x,
+            y: center_cc44.y,
+            z: 2024.0,
+            omega_deg: 0.01,
+            phi_deg: -0.01,
+            kappa_deg: -40.4,
+        };
+        let cam = build_pinhole_for_pose(&cal, &pose, 31520, 13760, 0, 0);
+        let corners_px = [(0.0, 0.0), (31520.0, 0.0), (31520.0, 13760.0), (0.0, 13760.0)];
+        let mut exact_corners = [[0.0f64; 2]; 4];
+        for (i, &(u, v)) in corners_px.iter().enumerate() {
+            let ray = cam.pixel_to_vector(Vec2::new(u, v));
+            let hit = mnt.intersect_ray_ground(cam.center, ray, 300.0, CrsId::CcZone(44)).unwrap();
+            exact_corners[i] = [hit.x, hit.y];
+        }
+        let mut fps = HashMap::new();
+        fps.insert(
+            "025_0727".into(),
+            ValidatedFootprint {
+                pose_id: "025_0727".into(),
+                x: pose.x,
+                y: pose.y,
+                corners_sol: exact_corners,
+            },
+        );
+
+        let rep_mnt = validate_chantier_footprints(&cal, &[pose.clone()], &[], &fps, Some(&mnt), CrsId::CcZone(44));
+        assert!(rep_mnt.used_lidar_mnt);
+        assert_eq!(rep_mnt.orientation_ok, 1);
+        assert!(rep_mnt.mean_iou_pct > 99.9, "Expected >99.9% IoU with LiDAR MNT, got {:.3}%", rep_mnt.mean_iou_pct);
+
+        let rep_flat = validate_chantier_footprints(&cal, &[pose], &[], &fps, None, CrsId::CcZone(44));
+        assert!(!rep_flat.used_lidar_mnt);
+        assert!(rep_mnt.mean_iou_pct > rep_flat.mean_iou_pct, "LiDAR MNT IoU should beat flat-plane IoU");
     }
 }
